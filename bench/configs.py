@@ -9,7 +9,7 @@ Experiments
   exp0  attention dominance : fixed Σn, sweep c finely to find c* where attention
                               time overtakes GEMM time; plus a small Σn sweep so
                               "latency ~ Σn alone" is a well-posed regression.
-  exp1  token fragmentation : fixed Σn split across B in {1..128}, uniform c.
+  exp1  token fragmentation : fixed Σn split across B in {1..512}, uniform c.
   exp2  n heterogeneity     : fixed Σn, B, c; vary CV(n).
   exp3  c heterogeneity     : fixed n, B, Σc; vary CV(c).   (AI-neutral control)
   exp4  n-c correlation     : same {n_i}, {c_i} multisets; vary pairing ρ(n,c).
@@ -111,18 +111,19 @@ class BatchConfig:
 
 # ---------------------------------------------------------------- Exp 0
 def exp0_attention_dominance():
-    """(a) Σn=8192 at B ∈ {1, 8, 64}, c swept geometrically: locate c* where the
-    attention share of iteration time crosses 50%.
-    (b) Σn ∈ {1024..8192} at B=8, c ∈ {0, 16K}: gives Σn variance for the
-    'latency ~ Σn alone' baseline regression."""
+    """(a) Σn=8192 at B ∈ {1, 8, 64, 256}, c swept geometrically up to 512K: locate
+    c* where the attention share of iteration time crosses 50%. B=256 (n=32) pushes
+    into the small-n / large-B corner where MLA's Σc_i decompression term matters most.
+    (b) Σn ∈ {1024..65536} at B=8, c ∈ {0, 16K}: gives Σn variance for the
+    'latency ~ Σn alone' baseline regression, up to a large-batch-budget scale."""
     cfgs = []
-    for B in [1, 8, 64]:
+    for B in [1, 8, 64, 256]:
         n = TOKEN_BUDGET // B
-        for c in [0, K, 2 * K, 4 * K, 8 * K, 16 * K, 32 * K, 64 * K, 128 * K]:
+        for c in [0, K, 2 * K, 4 * K, 8 * K, 16 * K, 32 * K, 64 * K, 128 * K, 256 * K, 512 * K]:
             cfgs.append(BatchConfig("exp0", f"dom_B{B}_n{n}_c{c}", [(n, c)] * B,
                                     group=f"B={B}"))
     for c in [0, 16 * K]:
-        for budget in [1024, 2048, 4096, 8192]:
+        for budget in [1024, 2048, 4096, 8192, 16384, 32768, 65536]:
             n = budget // 8
             cfgs.append(BatchConfig("exp0", f"budget{budget}_B8_n{n}_c{c}", [(n, c)] * 8,
                                     group=f"budget,c={c}"))
@@ -130,12 +131,13 @@ def exp0_attention_dominance():
 
 
 # ---------------------------------------------------------------- Exp 1
-def exp1_fragmentation(c_levels=(0, 4 * K, 16 * K, 64 * K, 128 * K)):
-    """Same Σn=8192 split across B in {1..128}; sweep uniform c."""
+def exp1_fragmentation(c_levels=(0, 4 * K, 16 * K, 64 * K, 128 * K, 256 * K, 512 * K)):
+    """Same Σn=8192 split across B in {1..512} (n from 8192 down to 16); sweep
+    uniform c up to 512K."""
     cfgs = []
     for c in c_levels:
         c = align(c)
-        for B in [1, 2, 4, 8, 16, 32, 64, 128]:
+        for B in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]:
             n = TOKEN_BUDGET // B
             cfgs.append(BatchConfig("exp1", f"B{B}_n{n}_c{c}", [(n, c)] * B,
                                     group=f"c={c}"))
@@ -150,17 +152,20 @@ N_VARIANTS = {
     "cv0.38": [512, 512, 768, 896, 1152, 1280, 1536, 1536],
     "cv1.03": [128, 256, 384, 512, 768, 1024, 1536, 3584],
     "cv1.87": [64, 64, 128, 128, 256, 512, 1024, 6016],
+    # 7 near-idle continuations (n=16) + one huge new-conversation prefill: the
+    # extreme multi-turn shape this benchmark targets
+    "cv2.60": [16, 16, 16, 16, 16, 16, 16, 8080],
 }
 
 
 def exp2_n_heterogeneity(base_c):
-    """Σn=8192, B=8, uniform c ∈ {0, base_c, 2·base_c}; vary CV(n).
+    """Σn=8192, B=8, uniform c ∈ {0, base_c, 2·base_c, 4·base_c}; vary CV(n).
     At c=0 the AI itself changes with CV(n) (Σn_i² term); at c ≫ n the AI is
     ~constant and the experiment isolates kernel-level effects."""
     for k, v in N_VARIANTS.items():
         assert sum(v) == TOKEN_BUDGET, (k, sum(v))
     cfgs = []
-    for c in [0, align(base_c), align(2 * base_c)]:
+    for c in [0, align(base_c), align(2 * base_c), align(4 * base_c)]:
         for k, ns in N_VARIANTS.items():
             cfgs.append(BatchConfig("exp2", f"{k}_c{c}", [(n, c) for n in ns],
                                     group=f"c={c}"))
@@ -174,6 +179,8 @@ C_TEMPLATES = {
     "cv0.29": [16, 24, 28, 32, 32, 36, 40, 48],
     "cv0.61": [8, 12, 16, 24, 32, 44, 56, 64],
     "cv1.27": [4, 4, 8, 8, 16, 24, 64, 128],
+    # 4K-context continuations alongside a ~192K-context outlier (unit = base_c/32)
+    "cv1.94": [2, 2, 2, 2, 4, 8, 44, 192],
 }
 
 
@@ -196,11 +203,11 @@ def exp3_c_heterogeneity(base_c):
 
 
 # ---------------------------------------------------------------- Exp 4
-EXP4_NS = [64, 128, 256, 512, 1024, 1536, 2048, 2624]         # Σ = 8192
-EXP4_C_TEMPLATE = [4, 8, 12, 16, 24, 40, 56, 96]              # × base_c/32, Σ = 256 → mean = base_c
+EXP4_NS = [32, 64, 128, 256, 512, 1024, 2048, 4128]           # Σ = 8192, 129× spread
+EXP4_C_TEMPLATE = [2, 4, 8, 16, 24, 40, 64, 98]               # × base_c/32, Σ = 256 → mean = base_c
 
 
-def exp4_correlation(base_c, n_points=5):
+def exp4_correlation(base_c, n_points=7):
     """Same {n_i}, {c_i} multisets, Σn, Σc, B; only the pairing differs.
     All 8! pairings are enumerated; the attainable Pearson range [ρ_min, ρ_max]
     is split into n_points evenly spaced targets and the closest pairing is

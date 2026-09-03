@@ -134,15 +134,19 @@ MoE는 `fused_moe_kernel` + `moe_align_block_size_*` + `topk_softmax`/`moe_sum_*
 
 | | 고정 | 변화 | 목적 |
 |---|---|---|---|
-| Exp0 dominance | Σn=8192, B ∈ {1, 8, 64} | c ∈ {0, 1K, …, 128K} | **c\* 발견** (attention 시간 비중 ≥ 50%) |
-| Exp0 budget | B=8, c ∈ {0, 16K} | Σn ∈ {1K, 2K, 4K, 8K} | `latency ~ Σn` baseline 회귀용 |
-| Exp1 fragmentation | Σn=8192, c 균일 | B ∈ {1..128} | 같은 budget, B에 따른 throughput |
-| Exp2 n-heterogeneity | Σn=8192, B=8, c ∈ {0, base_c, 2·base_c} | CV(n) ∈ {0, .18, .38, 1.03, 1.87} | Σn_i² 효과 (c=0) / kernel 효과 (c≫n) |
-| Exp3 c-heterogeneity | n=1024, B=8, mean(c)=base_c | CV(c) ∈ {0, .29, .61, 1.27} | AI-neutral control |
-| Exp4 n-c correlation | 동일 {n},{c} multiset, mean(c)=base_c, B=8 | ρ ∈ 도달 가능 범위 5점 (≈ −0.8 … +0.97) | Σn_i·c_i 효과 (multi-turn의 핵심 항) |
+| Exp0 dominance | Σn=8192, B ∈ {1, 8, 64, 256} | c ∈ {0, 1K, …, 512K} | **c\* 발견** (attention 시간 비중 ≥ 50%); B=256(n=32)은 MLA의 Σc\_i 항이 가장 크게 보이는 구석 |
+| Exp0 budget | B=8, c ∈ {0, 16K} | Σn ∈ {1K, 2K, …, 64K} | `latency ~ Σn` baseline 회귀용 |
+| Exp1 fragmentation | Σn=8192, c 균일 | B ∈ {1..512}, c ∈ {0, 4K, …, 512K} | 같은 budget, B·c에 따른 throughput |
+| Exp2 n-heterogeneity | Σn=8192, B=8, c ∈ {0, base_c, 2·base_c, 4·base_c} | CV(n) ∈ {0, .18, .38, 1.03, 1.87, 2.60} | Σn_i² 효과 (c=0) / kernel 효과 (c≫n) |
+| Exp3 c-heterogeneity | n=1024, B=8, mean(c)=base_c | CV(c) ∈ {0, .29, .61, 1.27, 1.94} | AI-neutral control |
+| Exp4 n-c correlation | 동일 {n},{c} multiset, mean(c)=base_c, B=8 | ρ ∈ 도달 가능 범위 7점 (≈ −0.6 … +0.98) | Σn_i·c_i 효과 (multi-turn의 핵심 항) |
 
 `base_c`는 기본 `auto`(분석적 c\*(n=1024) 이상의 2의 거듭제곱)이며, Exp0 실측 c\*를
 보고 `--base-c`로 override한다. 동일 shape는 한 번만 측정하고 alias별로 기록한다.
+`{n},{c}` multiset을 넓힌 대가로 Exp4의 도달 가능 ρ 범위는 좌우 비대칭이다(음의
+방향이 더 좁음) — 두 극단 multiset이 완전히 skew-대칭이 아니기 때문이며, 표시되는
+config 이름은 목표값이 아니라 실제 도달한 ρ다. 전체 config는 164개(중복 shape 제거 후
+약 129개 측정), 이전(약 99개) 대비 넓어진 sweep이다.
 
 ## 5. 실행
 

@@ -18,8 +18,8 @@ import matplotlib.pyplot as plt
 from bench.metrics import MODEL_PRESETS, estimate_flops_bytes
 
 DEFAULT = ["qwen1.5-1.8b", "qwen3-1.7b", "qwen2.5-3b", "qwen1.5-moe-a2.7b", "mla-dense-1.8b", "deepseek-v2-lite"]
-NS = [64, 256, 1024, 8192]
-CS = [0] + [2 ** k for k in range(8, 18)]          # 0, 256 … 131072
+NS = [32, 64, 256, 1024, 8192]
+CS = [0] + [2 ** k for k in range(7, 20)]          # 0, 128 … 524288 — matches Exp0/1's range
 
 
 def main():
