@@ -105,7 +105,7 @@ K·V read. 분자는 (n, c)에 2차, 분모는 1차이므로 heterogeneity는 �
 |---|---|
 | `VLLM_ENABLE_V1_MULTIPROCESSING=0` | 기본값(1)은 EngineCore가 별도 프로세스에서 자체 loop를 돌고 `step()`은 출력만 꺼냄 |
 | `async_scheduling=False` | 기본값(True)은 `step()`이 forward 완료 전에 반환 (출력은 다음 `step()`) |
-| `attention_backend="FLASH_ATTN"` | env var `VLLM_ATTENTION_BACKEND`는 제거됨. A100→FA2, H100→FA3. MLA 모델은 auto |
+| `attention_backend="FLASH_ATTN"` | env var `VLLM_ATTENTION_BACKEND`는 제거됨. A100→FA2, H100→FA3. MLA 모델, 또는 pre-Hopper + `--kv-cache-dtype fp8`은 auto |
 | `hf_overrides.max_position_embeddings ≥ max(c+n)` | RoPE cos/sin 테이블 크기. `VLLM_ALLOW_LONG_MAX_MODEL_LEN`만 쓰면 OOB |
 | `disable_cascade_attn=True`, `block_size=16` | 경로 고정 |
 
@@ -191,6 +191,10 @@ per-iteration busy time은 kernel profile을 쓸 것). `--trust-remote-code`는 
 - `exp1_fragmentation.png`, `exp2_n_hetero.png`, `exp3_c_hetero.png`, `exp4_pairing.png`
 - `arch_compare.png/.txt` — 분석 모델의 아키텍처 비교
 - `report.txt` — c\*, 고정 budget에서의 latency 산포, cost-model R² 비교, 효과 분해 표
+
+GPU 없이 `analyze.py`/`arch_compare.py` 파이프라인만 시험하려면 `bench/synth_results.py`가
+toy latency model로 스키마가 동일한 `raw.jsonl`을 생성한다(측정값 아님):
+`python -m bench.synth_results --out results/synth.jsonl --models qwen1.5-1.8b deepseek-v2-lite`.
 
 ## 7. 해석 가이드
 
