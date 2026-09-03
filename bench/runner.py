@@ -154,9 +154,35 @@ def drain(engine):
     return outs
 
 
-def profile_step(engine):
-    """Run one engine.step() under torch.profiler (CUDA activity only);
-    return per-class kernel time [µs] and the top kernels."""
+def validate_buckets(buckets, is_moe):
+    """Warnings about a profiled step's kernel classification (pure; unit-tested
+    in bench/selftest.py). Empty means the split looks plausible for this model."""
+    total = sum(buckets.values())
+    if total <= 0:
+        return ["no CUDA kernels captured"]
+    warn = []
+    if buckets["attention"] <= 0:
+        warn.append("attention bucket is EMPTY — no kernel matched ATTN_KEYS; "
+                    "attention time is being counted elsewhere")
+    if is_moe and buckets["moe"] <= 0:
+        warn.append("MoE model but moe bucket is EMPTY — expert-GEMM time is being counted elsewhere")
+    if not is_moe and buckets["moe"] > 0:
+        warn.append("dense model but moe bucket is non-empty — a MOE_KEYS substring is over-matching")
+    if buckets["other"] > 0.25 * total:
+        warn.append(f"unclassified 'other' is {buckets['other']/total:.0%} of kernel time")
+    return warn
+
+
+def profile_step(engine, spec, warn_state):
+    """Run one engine.step() under torch.profiler (CUDA activity only); return
+    per-class kernel time [µs], the top kernels, and the top unclassified ones.
+
+    Also validates the classification: buckets that must carry time for this
+    model (attention always; moe for MoE models) and the size of the "other"
+    bucket are checked, so a kernel name this build does not match shows up as a
+    warning instead of silently moving time between buckets. `warn_state` is a
+    set used to print each distinct warning only once per run.
+    """
     import torch
     from torch.profiler import profile, ProfilerActivity
     torch.cuda.synchronize()
@@ -171,14 +197,26 @@ def profile_step(engine):
             continue
         buckets[classify(ev.key)] += us
         per_kernel[ev.key] = per_kernel.get(ev.key, 0.0) + us
-    if sum(buckets.values()) <= 0:
+    total = sum(buckets.values())
+    if total <= 0:
         print("[profile] WARNING: no CUDA kernels captured (CUPTI unavailable?); kernel times omitted")
         return None
+
+    unclassified = sorted(((k, v) for k, v in per_kernel.items() if classify(k) == "other"),
+                          key=lambda kv: -kv[1])
+    for w in validate_buckets(buckets, spec.is_moe):
+        if w not in warn_state:
+            warn_state.add(w)
+            print(f"[profile] WARNING: {w}")
+            for k, v in unclassified[:5]:
+                print(f"[profile]   unclassified {v/1e3:8.2f} ms  {k[:120]}")
     top = sorted(per_kernel.items(), key=lambda kv: -kv[1])[:15]
-    return buckets, [(k[:160], round(v, 1), classify(k)) for k, v in top]
+    return (buckets,
+            [(k[:160], round(v, 1), classify(k)) for k, v in top],
+            [(k[:160], round(v, 1)) for k, v in unclassified[:10]])
 
 
-def run_shape(engine, spec, cfg, args, rng, capacity, sampler):
+def run_shape(engine, spec, cfg, args, rng, capacity, sampler, warn_state):
     """Measure one batch shape; returns a result dict (or a skip record)."""
     from vllm import SamplingParams, TokensPrompt
     import torch
@@ -237,9 +275,11 @@ def run_shape(engine, spec, cfg, args, rng, capacity, sampler):
 
     kernels = None
     if args.kernel_profile:
-        submit("prof-warm"); profile_step(engine); drain(engine)   # CUPTI init outside the record
+        submit("prof-warm")
+        profile_step(engine, spec, warn_state)      # CUPTI init outside the recorded step
+        drain(engine)
         submit("prof")
-        kernels = profile_step(engine)
+        kernels = profile_step(engine, spec, warn_state)
         drain(engine)
 
     lat = sorted(r["latency_s"] for r in results)
@@ -263,8 +303,9 @@ def run_shape(engine, spec, cfg, args, rng, capacity, sampler):
         cached_tokens_expected=s["sum_c"],
     )
     if kernels:
-        buckets, top = kernels
-        rec.update({f"kernel_time_{k}_us": v for k, v in buckets.items()}, kernel_top=top)
+        buckets, top, unclassified = kernels
+        rec.update({f"kernel_time_{k}_us": v for k, v in buckets.items()},
+                   kernel_top=top, kernel_unclassified=unclassified)
     return rec
 
 
@@ -345,12 +386,13 @@ def main():
     outp = Path(args.out)
     outp.parent.mkdir(parents=True, exist_ok=True)
     consecutive_errors = []
+    warn_state = set()                          # each profiling warning printed once per run
     with outp.open("a") as f:
         for key, aliases in shapes.items():
             cfg = aliases[0]
             t = time.time()
             try:
-                res = run_shape(engine, spec, cfg, args, rng, capacity, sampler)
+                res = run_shape(engine, spec, cfg, args, rng, capacity, sampler, warn_state)
                 consecutive_errors = []
             except Exception as e:                      # OOM etc. — record and continue
                 res = dict(skipped=True, reason=repr(e))

@@ -154,7 +154,8 @@ config 이름은 목표값이 아니라 실제 도달한 ρ다. 전체 config는
 pip install "vllm==0.28.*" pynvml pandas matplotlib     # kernel 이름/API는 0.28 기준
 cd AgentSched
 
-# 0. GPU 없이: 아키텍처 비교 + feasibility
+# 0. GPU 없이: 측정 검증 + 아키텍처 비교 + feasibility
+python -m bench.selftest                                            # §7, 항상 먼저
 python -m bench.arch_compare --gpu-mem-gib 80
 python -m bench.configs --model qwen1.5-1.8b --gpu-mem-gib 80        # base_c auto, gate 0.95
 
@@ -200,7 +201,42 @@ GPU 없이 `analyze.py`/`arch_compare.py` 파이프라인만 시험하려면 `be
 toy latency model로 스키마가 동일한 `raw.jsonl`을 생성한다(측정값 아님):
 `python -m bench.synth_results --out results/synth.jsonl --models qwen1.5-1.8b deepseek-v2-lite`.
 
-## 7. 해석 가이드
+## 7. 측정 검증 (`python -m bench.selftest`)
+
+attention/MoE 시간이 실제로 제대로 잡히는지는 세 단계로 검증한다. 앞의 두 개는
+GPU 없이 항상 실행 가능하고, 세 번째는 실제 실행 중에 자동으로 경고를 낸다.
+
+1. **Kernel 분류 (31개 실제 kernel 이름)**: vLLM 0.28이 A100/H100에서 실제로 띄우는
+   kernel 이름들을 `classify()`에 넣어 의도한 버킷으로 가는지 확인한다. substring
+   매칭은 순서에 민감해서 조용히 틀리기 쉽다 — FA3 이름에 `cutlass::device_kernel`이
+   들어가고(GEMM 키보다 먼저 검사해야 함), KV write kernel 이름에 `flash`가 들어가며
+   (`reshape_and_cache_flash_kernel`), MLA context gather 이름에는 `cache`가 들어간다
+   (`gather_and_maybe_dequant_cache_page`, attention으로 분류돼야 함). 특히 A100
+   dense attention은 vLLM이 항상 block_table을 넘기기 때문에 prefill에서도
+   `flash_fwd_kernel`이 아니라 **`flash_fwd_splitkv_kernel`** 이 뜬다 — 이걸 놓치면
+   dense attention 시간이 통째로 사라진다.
+2. **분석 모델 수치**: `est_flops_attn`, `est_attn_bytes`, MLA decompression,
+   MoE active params / expert weight traffic를 손 유도값과 대조한다. 확인된 값:
+   MHA attention FLOPs = `4·H·d·L·Σn(c+(n+1)/2)`, README AI 식이 계수 1로 정확히
+   성립, MLA decompression 113 MFLOP/cached token (n과 무관, Σc에만 비례),
+   Qwen1.5-MoE expert weight 24.91 GB·DeepSeek-V2-Lite 28.79 GB per iteration
+   (Σn에 거의 무관한 floor).
+3. **실행 중 자동 경고**: `--kernel-profile`이 profile마다 버킷 구성을 점검해
+   attention 버킷이 비었거나, MoE 모델인데 moe 버킷이 비었거나, dense 모델인데 moe
+   버킷이 찼거나, 미분류 `other`가 25%를 넘으면 경고하고 미분류 kernel 상위 5개를
+   출력한다. 매 config의 미분류 목록은 `kernel_unclassified`로 raw.jsonl에도 남는다.
+
+**분류기가 원리적으로 구분할 수 없는 것** (측정 시 감안할 것):
+
+- MLA의 `kv_b_proj` decompression은 cuBLAS GEMM이라 이름만으로는 GEMM 버킷에 들어간다.
+  분석 모델에서만 attention side로 계산되므로, MLA 모델에서 측정 attention 비중은
+  분석 FLOP 비중보다 낮게 나온다. 분리하려면 `_compute_prefill_context`에
+  `record_function`을 감싸야 한다.
+- MoE의 shared expert와 router gate는 일반 cuBLAS GEMM이라 GEMM 버킷에 들어간다.
+  moe 버킷은 Triton `fused_moe_kernel` 등 routed-expert 경로만 잡는다.
+- `act_and_mul_kernel`(SiLU)은 dense MLP와 MoE expert가 공유해서 `other`로 간다.
+
+## 8. 해석 가이드
 
 **효과 분해** (Exp2–4, homogeneous / ρ≈0 기준 대비):
 

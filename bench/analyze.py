@@ -269,7 +269,8 @@ def main():
         print("\n".join(f"  {m} {e}/{n}: {r}" for m, e, n, r in skipped))
         return
     df = add_efficiency_columns(df)
-    df.drop(columns=[c for c in ["latency_all_s", "pairs", "kernel_top", "model_attn_crossover_by_n"]
+    df.drop(columns=[c for c in ["latency_all_s", "pairs", "kernel_top", "kernel_unclassified",
+                                 "model_attn_crossover_by_n"]
                      if c in df.columns]).to_csv(outdir / "summary.csv", index=False)
 
     lines = []

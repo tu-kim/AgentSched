@@ -58,7 +58,7 @@ def main():
                                cached_tokens=s["sum_c"], cached_tokens_expected=s["sum_c"],
                                kernel_time_attention_us=t_attn * 1e6, kernel_time_gemm_us=t_gemm * 1e6,
                                kernel_time_moe_us=0.0, kernel_time_kvcache_us=50.0, kernel_time_other_us=300.0,
-                               kernel_top=[])
+                               kernel_top=[], kernel_unclassified=[])
                 res.update(wall_s=0.0, **meta)
                 for a in aliases:
                     rec = dict(res, exp=a.exp, name=a.name, group=a.group)
