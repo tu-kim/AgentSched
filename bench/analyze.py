@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 
 from bench.metrics import DEVICE_PEAKS
 
-KERNEL_CLASSES = ["attention", "gemm", "moe", "kvcache", "other"]
+KERNEL_CLASSES = ["attention", "gemm", "moe", "activation", "kvcache", "other"]
 
 
 def load(paths):

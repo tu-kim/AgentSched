@@ -226,15 +226,24 @@ GPU 없이 항상 실행 가능하고, 세 번째는 실제 실행 중에 자동
    버킷이 찼거나, 미분류 `other`가 25%를 넘으면 경고하고 미분류 kernel 상위 5개를
    출력한다. 매 config의 미분류 목록은 `kernel_unclassified`로 raw.jsonl에도 남는다.
 
-**분류기가 원리적으로 구분할 수 없는 것** (측정 시 감안할 것):
+**분류기가 원리적으로 구분할 수 없는 것** (vLLM 0.28 소스에서 한 prefill step의 kernel을
+전수 열거해 확인. 측정 해석 시 반드시 감안할 것):
 
-- MLA의 `kv_b_proj` decompression은 cuBLAS GEMM이라 이름만으로는 GEMM 버킷에 들어간다.
-  분석 모델에서만 attention side로 계산되므로, MLA 모델에서 측정 attention 비중은
-  분석 FLOP 비중보다 낮게 나온다. 분리하려면 `_compute_prefill_context`에
-  `record_function`을 감싸야 한다.
-- MoE의 shared expert와 router gate는 일반 cuBLAS GEMM이라 GEMM 버킷에 들어간다.
-  moe 버킷은 Triton `fused_moe_kernel` 등 routed-expert 경로만 잡는다.
-- `act_and_mul_kernel`(SiLU)은 dense MLP와 MoE expert가 공유해서 `other`로 간다.
+- **MoE 버킷은 MoE 블록의 약 절반만 잡는다.** shared expert와 router gate는 일반 cuBLAS
+  GEMM이라 GEMM 버킷으로 간다. Qwen1.5-MoE 기준 shared expert FLOPs(token당 69.2 MFLOP)는
+  routed top-4 expert와 **거의 동일**하므로, `kernel_time_moe_us`는 MoE 연산의 절반 수준이다.
+  Σn에 비례하는 부분(shared/gate)과 expert weight floor(routed)를 나눠 보려면 이 점이 중요하다.
+- **MLA의 `kv_b_proj` decompression은 cuBLAS GEMM**이라 GEMM 버킷에 들어간다.
+  DeepSeek-V2-Lite, B=8·n=1024·c=32K 기준 step time의 **약 14%**로 추정되며 Σc에 비례한다.
+  같은 조건에서 MLA context FA2가 약 52%다. 추가로 k-concat 복사와 V zero-pad(128→192)도
+  Σc에 비례하지만 `other`로 간다. 정확히 분리하려면 `_compute_prefill_context`를
+  `record_function`으로 감싸야 한다.
+- `act_and_mul`(SwiGLU)은 routed expert·shared expert·dense MLP가 모두 같은 kernel을 쓰므로
+  귀속이 불가능하다. `other`를 오염시키지 않도록 **별도 `activation` 버킷**으로 뺐다.
+- **`--enforce-eager` 여부로 `other`/`activation`의 구성이 완전히 바뀐다.** 기본값(compiled)에서는
+  RMSNorm·RoPE·SiLU가 Inductor Triton kernel(`triton_*_fused_*`)이 되고, eager에서는
+  `vllm::rms_norm_kernel` 등 vLLM CUDA kernel이 된다. attention/MoE/KV-write 버킷은 opaque
+  custom op 안이라 두 모드에서 동일하다. 모드가 다른 결과끼리 `other`를 비교하면 안 된다.
 
 ## 8. 해석 가이드
 
@@ -249,6 +258,12 @@ latency_ratio  = work_ratio × (1 / tflops_ratio)
 
 `work_ratio`로 설명되는 부분은 scheduler가 `(Σn, Σc, Σn², Σnc, B)`만으로 예측할 수
 있고, `tflops_ratio`로 남는 부분이 cost model이 놓치는 잔차다.
+
+**Exp2에서 잔차가 나올 것으로 예상되는 메커니즘**: vLLM의 FA2 varlen 커널은 grid를
+`ceil(max_i n_i / 64) × B × H`로 잡고, 자기 request 길이를 넘는 block은 early-exit한다.
+즉 **grid는 Σn이 아니라 max(n_i)로 결정**되므로, Σn을 고정한 채 CV(n)을 키우면 max(n_i)가
+커지면서 빈 block이 늘어난다. Exp2의 `tflops_ratio` 하락이 이 예측과 맞는지 확인할 것
+(맞다면 scheduler cost model에 `max(n_i)` 항을 넣을 근거가 된다).
 
 **Cost-model R²**: `latency ~ Σn` 단독 vs `+ Σn_i(c_i+n_i/2)` vs 충분통계량 5개, 전체
 config와 `c ≥ c*` subset 각각. 후자에서 `Σn` 단독 R²가 낮고 shape-aware 모델의 R²가

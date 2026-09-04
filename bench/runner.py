@@ -54,8 +54,14 @@ KVCACHE_KEYS = ("reshape_and_cache", "concat_and_cache", "_and_cache")
 ATTN_KEYS = ("flashattnfwd", "flash::", "flash_fwd", "pytorch_flash::", "merge_attn_states",
              "prepare_varlen_num_blocks", "gather_and_maybe_dequant", "fwd_grouped_kernel",
              "fwd_kernel_stage", "_mla", "fmha", "attn_fwd", "paged_attention")
+# E=60 (Qwen1.5-MoE) is not one of the sizes the fused topkGating kernel is
+# instantiated for, so the router falls back to moeSoftmax + moeTopK.
 MOE_KEYS = ("fused_moe", "moe_align", "moe_sum", "count_and_sort_expert", "topk_softmax",
             "topkgating", "moesoftmax", "moetopk", "grouped_topk", "moe_")
+# SwiGLU activation. Routed experts, shared experts and dense MLPs all emit the
+# same kernel, so it cannot be attributed to MoE by name; kept as its own bucket
+# rather than polluting "other" (norms / rope / copies / sampling).
+ACT_KEYS = ("act_and_mul", "silu", "gelu_and_mul", "swiglu")
 GEMM_KEYS = ("nvjet", "xmma", "gemm", "gemv", "cutlass3x", "kernel2<", "cutlass::kernel<",
              "cutlass_80", "ampere_", "sm80_", "splitkreduce", "cublas", "wgmma", "s16816", "matmul")
 
@@ -68,6 +74,8 @@ def classify(name):
         return "attention"
     if any(k in n for k in MOE_KEYS):
         return "moe"
+    if any(k in n for k in ACT_KEYS):
+        return "activation"
     if any(k in n for k in GEMM_KEYS):
         return "gemm"
     return "other"
@@ -157,6 +165,8 @@ def drain(engine):
 def validate_buckets(buckets, is_moe):
     """Warnings about a profiled step's kernel classification (pure; unit-tested
     in bench/selftest.py). Empty means the split looks plausible for this model."""
+    buckets = {k: buckets.get(k, 0.0) for k in
+               ("attention", "gemm", "moe", "activation", "kvcache", "other")}
     total = sum(buckets.values())
     if total <= 0:
         return ["no CUDA kernels captured"]
@@ -189,7 +199,8 @@ def profile_step(engine, spec, warn_state):
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         engine.step()
         torch.cuda.synchronize()
-    buckets = {"attention": 0.0, "gemm": 0.0, "moe": 0.0, "kvcache": 0.0, "other": 0.0}
+    buckets = {"attention": 0.0, "gemm": 0.0, "moe": 0.0, "activation": 0.0,
+               "kvcache": 0.0, "other": 0.0}
     per_kernel = {}
     for ev in prof.key_averages():
         us = getattr(ev, "self_device_time_total", 0) or 0

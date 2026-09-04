@@ -61,12 +61,21 @@ KERNEL_CASES = [
 
     # ---- MoE
     ("fused_moe_kernel", "moe", "Triton expert GEMM (the bulk of MoE time)"),
-    ("void vllm::moe_align_block_size_kernel<int>(...)", "moe", ""),
-    ("void vllm::count_and_sort_expert_tokens_kernel<int>(...)", "moe", ""),
-    ("void vllm::moe_align_block_size_small_batch_expert_kernel<int>(...)", "moe", ""),
-    ("void vllm::moe_sum_kernel<c10::BFloat16, 4>(...)", "moe", ""),
-    ("void vllm::topk_softmax_kernel<...>(...)", "moe", "Qwen2-MoE router"),
-    ("void tensorrt_llm::kernels::topkGatingSoftmax<...>(...)", "moe", "fused router variant"),
+    ("void vllm::moe::moe_align_block_size_kernel<int>(...)", "moe", ""),
+    ("void vllm::moe::count_and_sort_expert_tokens_kernel<int>(...)", "moe", ""),
+    ("void vllm::moe::moe_align_block_size_small_batch_expert_kernel<int>(...)", "moe", "Σn < 256 path"),
+    ("void vllm::moe::moe_sum_vec_kernel<c10::BFloat16, int, 4, false>(...)", "moe", "topk<=8 vec path"),
+    ("void vllm::moe::topkGating<16, 64, 4, 16, int, __nv_bfloat16, (vllm::moe::ScoringFunc)0>(...)",
+     "moe", "DeepSeek-V2-Lite router (E=64 hits the fused kernel)"),
+    ("void vllm::moeSoftmax<256, __nv_bfloat16>(...)", "moe",
+     "Qwen1.5-MoE router: E=60 is not an instantiated size, so the fused kernel is NOT used"),
+    ("void vllm::moeTopK<256, int>(...)", "moe", "second half of the E=60 router fallback"),
+
+    # ---- SwiGLU activation: emitted identically by routed experts, shared experts
+    # and dense MLPs, so it gets its own bucket instead of being guessed at.
+    ("void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162,"
+     " &vllm::silu_kernel<c10::BFloat16>, true>(...)", "activation", "enforce_eager path"),
+    ("triton_poi_fused_mul_silu_3", "activation", "inductor path (enforce_eager=False)"),
 
     # ---- GEMM families (cuBLAS / CUTLASS) seen on A100 and H100
     ("ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_32x5_tn", "gemm", "A100 cuBLAS"),
@@ -74,18 +83,26 @@ KERNEL_CASES = [
     ("nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN", "gemm", "cuBLAS >= 12.6 nvJet"),
     ("void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_bf16_128x128_32x5_tn_align8>(...)",
      "gemm", "CUTLASS 2.x"),
+    ("void cutlass::device_kernel<cutlass_80_tensorop_bf16_s16816gemm_bf16_256x128_32x3_tn_align8>(...)",
+     "gemm", "CUTLASS 3.x wrapper on Ampere — must not be mistaken for the FA3 name"),
+    ("void gemv2T_kernel_val<int, int, __nv_bfloat16, ...>(...)", "gemm", "skinny shared-expert gate"),
     ("void splitKreduce_kernel<...>(...)", "gemm", "cuBLAS split-K reduction"),
 
-    # ---- deliberately unclassified: elementwise / norm / rope / sampling.
-    # These are real time but not attributable to attention or MoE by name alone
-    # (act_and_mul is used by both dense MLP and MoE experts).
-    ("void vllm::rms_norm_kernel<c10::BFloat16>(...)", "other", ""),
-    ("void vllm::fused_add_rms_norm_kernel<c10::BFloat16, 8>(...)", "other", ""),
-    ("void vllm::rotary_embedding_kernel<c10::BFloat16, true>(...)", "other", ""),
-    ("void vllm::act_and_mul_kernel<c10::BFloat16, &vllm::silu_kernel<c10::BFloat16>, (bool)1>(...)",
-     "other", "shared by dense MLP and MoE experts — not attributable by name"),
-    ("void at::native::elementwise_kernel<128, 2, ...>(...)", "other", "V pad / concat copies"),
-    ("triton_poi_fused_mul_sum_0", "other", "inductor fusion (grouped_topk, enforce_eager=False)"),
+    # ---- deliberately unclassified: norms / rope / copies / embedding / sampling.
+    ("void vllm::rms_norm_kernel<c10::BFloat16, 8, 2, true>(...)", "other", ""),
+    ("void vllm::fused_add_rms_norm_kernel<c10::BFloat16, 8, true>(...)", "other", ""),
+    ("void vllm::rotary_embedding_kernel<c10::BFloat16, c10::BFloat16, true>(...)", "other", ""),
+    ("triton_red_fused_add_mean_mul_pow_rsqrt_0", "other", "inductor RMSNorm (default mode)"),
+    ("triton_poi_fused_cat_index_select_mul_neg_stack_7", "other", "inductor RoPE (default mode)"),
+    ("void at::native::elementwise_kernel<128, 2, ...CopyFunctor...>(...)", "other",
+     "MLA k-concat copies — scale with Σc but are not attributable by name"),
+    ("void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::BFloat16>>(...)",
+     "other", "MLA V zero-pad (128 -> 192) on FA2"),
+    ("void at::native::indexSelectLargeIndex<c10::BFloat16, long, unsigned int, 2, 2, -2, true>(...)",
+     "other", "input embedding gather"),
+    ("void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float,"
+     " at::native::ArgMaxOps<float>, ...>>(...)", "other", "greedy sampling argmax"),
+    ("_compute_slot_mapping_kernel", "other", "Triton block-table helper"),
 ]
 
 
@@ -105,8 +122,8 @@ def check_classifier():
 def check_runtime_validation():
     """The warnings runner.profile_step emits on a real GPU run must fire for the
     failure modes that would silently corrupt the attention / MoE split."""
-    B = lambda a=1.0, g=1.0, m=0.0, k=0.1, o=0.1: dict(
-        attention=a, gemm=g, moe=m, kvcache=k, other=o)
+    B = lambda a=1.0, g=1.0, m=0.0, act=0.1, k=0.1, o=0.1: dict(
+        attention=a, gemm=g, moe=m, activation=act, kvcache=k, other=o)
     cases = [
         ("healthy dense", B(), False, False),
         ("healthy MoE", B(m=2.0), True, False),
@@ -114,7 +131,8 @@ def check_runtime_validation():
         ("MoE model, empty moe bucket", B(), True, True),
         ("dense model, moe bucket non-empty", B(m=1.0), False, True),
         ("other > 25%", B(o=5.0), False, True),
-        ("nothing captured", dict(attention=0.0, gemm=0.0, moe=0.0, kvcache=0.0, other=0.0), False, True),
+        ("activation is not counted as 'other'", B(act=5.0), False, False),
+        ("nothing captured", {k: 0.0 for k in B()}, False, True),
     ]
     ok = True
     for label, buckets, is_moe, want_warn in cases:
