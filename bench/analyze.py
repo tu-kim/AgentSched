@@ -59,11 +59,21 @@ def homogeneous_reference(df, exp):
 def add_efficiency_columns(df):
     """Decompose each config's latency relative to its homogeneous reference:
        latency_ratio       = lat / lat_ref                   (total effect)
-       work_ratio          = Σn(c+n/2)_causal / ref          (attention-work → AI effect)
+       flops_ratio         = est_flops_total / ref           (all analytic work)
+       work_ratio          = Σn(c+n/2)_causal / ref          (attention work only)
        tflops_ratio        = achieved_tflops / ref           (kernel-efficiency effect)
        batching_efficiency = throughput / throughput_ref
+
+    Because achieved_tflops is est_flops_total/latency, the identity
+        latency_ratio == flops_ratio / tflops_ratio
+    holds exactly; it is an attribution of the observed latency change into
+    "more analytic work" and "less efficiency", not an independent check.
+    work_ratio is the attention-only part of flops_ratio — the part a scheduler
+    can predict from (Σn, Σc, Σn², Σnc, B) — and equals it only where attention
+    dominates.
     """
-    for col in ["latency_ratio", "work_ratio", "tflops_ratio", "batching_efficiency"]:
+    for col in ["latency_ratio", "flops_ratio", "work_ratio", "tflops_ratio",
+                "batching_efficiency"]:
         df[col] = np.nan
     for exp in ["exp2", "exp3", "exp4"]:
         if exp not in set(df.exp):
@@ -72,6 +82,7 @@ def add_efficiency_columns(df):
         for i, r in df[df.exp == exp].iterrows():
             ref = refs[(r.model_short, r.group)]
             df.at[i, "latency_ratio"] = r.latency_median_s / ref.latency_median_s
+            df.at[i, "flops_ratio"] = r.est_flops_total / ref.est_flops_total
             df.at[i, "work_ratio"] = r.sum_n_ctx_causal / ref.sum_n_ctx_causal
             df.at[i, "tflops_ratio"] = r.achieved_tflops / ref.achieved_tflops
             df.at[i, "batching_efficiency"] = r.throughput_tok_s / ref.throughput_tok_s
@@ -168,7 +179,8 @@ def plot_hetero(df, exp, xcol, title, outdir, lines):
         return
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
     lines.append(f"== {title} ==")
-    lines.append(f"  {'model':22s} {'group':14s} {xcol:>6s} {'lat×':>6s} {'work×':>6s} {'TFLOPS×':>8s} {'eff':>6s}")
+    lines.append(f"  {'model':22s} {'group':14s} {xcol:>6s} {'lat×':>6s} {'FLOP×':>6s} {'work×':>6s} "
+                 f"{'TFLOPS×':>8s} {'eff':>6s}")
     multi = d.model_short.nunique() > 1
     for (m, g), gd in _sorted_groups(d):
         gd = gd.sort_values(xcol)
@@ -177,7 +189,8 @@ def plot_hetero(df, exp, xcol, title, outdir, lines):
         axes[0].plot(gd[xcol], gd.work_ratio, "x--", alpha=.6, label=f"{lbl} attn-work× (AI effect)")
         axes[1].plot(gd[xcol], gd.tflops_ratio, "o-", label=lbl)
         for _, r in gd.iterrows():
-            lines.append(f"  {m:22s} {g:14s} {r[xcol]:6.2f} {r.latency_ratio:6.3f} {r.work_ratio:6.3f} "
+            lines.append(f"  {m:22s} {g:14s} {r[xcol]:6.2f} {r.latency_ratio:6.3f} "
+                         f"{r.flops_ratio:6.3f} {r.work_ratio:6.3f} "
                          f"{r.tflops_ratio:8.3f} {r.batching_efficiency:6.3f}")
     axes[0].set_ylabel("ratio vs homogeneous"); axes[0].set_title("total effect vs. work (AI) effect")
     axes[1].set_ylabel("achieved TFLOPS / homogeneous"); axes[1].set_title("kernel-efficiency effect")

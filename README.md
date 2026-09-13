@@ -154,7 +154,8 @@ config 이름은 목표값이 아니라 실제 도달한 ρ다. 전체 config는
 pip install "vllm==0.28.*" pynvml pandas matplotlib     # kernel 이름/API는 0.28 기준
 cd AgentSched
 
-# 0. GPU 없이: 측정 검증 + 아키텍처 비교 + feasibility
+# 0. GPU 없이: 테스트 + 측정 검증 + 아키텍처 비교 + feasibility
+python -m unittest discover -s tests -t .                           # 99 tests, ~2s
 python -m bench.selftest                                            # §7, 항상 먼저
 python -m bench.arch_compare --gpu-mem-gib 80
 python -m bench.configs --model qwen1.5-1.8b --gpu-mem-gib 80        # base_c auto, gate 0.95
@@ -208,10 +209,13 @@ GPU 없이 항상 실행 가능하고, 세 번째는 실제 실행 중에 자동
 
 1. **Kernel 분류 (31개 실제 kernel 이름)**: vLLM 0.28이 A100/H100에서 실제로 띄우는
    kernel 이름들을 `classify()`에 넣어 의도한 버킷으로 가는지 확인한다. substring
-   매칭은 순서에 민감해서 조용히 틀리기 쉽다 — FA3 이름에 `cutlass::device_kernel`이
-   들어가고(GEMM 키보다 먼저 검사해야 함), KV write kernel 이름에 `flash`가 들어가며
-   (`reshape_and_cache_flash_kernel`), MLA context gather 이름에는 `cache`가 들어간다
-   (`gather_and_maybe_dequant_cache_page`, attention으로 분류돼야 함). 특히 A100
+   매칭은 순서와 키 선택에 민감해서 조용히 틀리기 쉽다 — FA3 이름에
+   `cutlass::device_kernel`이 들어가 GEMM 키보다 먼저 검사해야 하고, MLA KV write
+   (`concat_and_cache_mla_kernel`)는 attention 키 `_mla`와 매칭되므로 KVCACHE를 먼저
+   봐야 하며, MLA context gather(`gather_and_maybe_dequant_cache_page`)는 `cache`가
+   들어가지만 attention으로 가야 한다. dense KV write(`reshape_and_cache_flash_kernel`)가
+   안전한 것은 attention 키가 bare `flash`가 아니라 `flash::`/`flash_fwd`이기 때문이다
+   (키를 넓히면 모든 KV write가 attention으로 빨려 들어간다). 특히 A100
    dense attention은 vLLM이 항상 block_table을 넘기기 때문에 prefill에서도
    `flash_fwd_kernel`이 아니라 **`flash_fwd_splitkv_kernel`** 이 뜬다 — 이걸 놓치면
    dense attention 시간이 통째로 사라진다.
@@ -245,19 +249,38 @@ GPU 없이 항상 실행 가능하고, 세 번째는 실제 실행 중에 자동
   `vllm::rms_norm_kernel` 등 vLLM CUDA kernel이 된다. attention/MoE/KV-write 버킷은 opaque
   custom op 안이라 두 모드에서 동일하다. 모드가 다른 결과끼리 `other`를 비교하면 안 된다.
 
-## 8. 해석 가이드
+## 8. 테스트 (`python -m unittest discover -s tests -t .`)
+
+GPU 없이 2초 안에 도는 99개 테스트. `bench/selftest.py`(§7)가 "측정이 물리적으로
+맞는가"를 보는 반면, 여기서는 "코드가 의도대로 동작하는가"를 본다.
+
+| 파일 | 커버 범위 | 대표적으로 잡는 것 |
+|---|---|---|
+| `test_configs.py` | 생성기 불변식 | exp3의 **AI-neutrality**(CV_c를 바꿔도 `sum_n_ctx`/`sum_nc` 불변 — 이게 깨지면 negative control이 아님), exp4가 `{n}`·`{c}` multiset과 Σn·Σc·B를 모두 고정하고 pairing만 바꾸는지, CV 라벨이 실제 CV와 일치하는지, `kv_tokens_needed`가 request별로 올림하는지, shape_key 순서 불변성 |
+| `test_metrics.py` | ModelSpec 파싱·유도량 | **preset 하드코딩 값 == config.json 파싱 결과** (손입력 오류 차단), MoE 키 변형(`num_experts`/`n_routed_experts`/`num_local_experts`), MLA c\*의 n 의존성, fp8 KV가 읽기 바이트를 반으로, expert weight가 Σn floor인지, attention 항의 request 가산성 |
+| `test_analyze.py` | 분석 파이프라인 | 효과 분해 항등식, 모델·그룹 간 기준행이 섞이지 않는지, c\* 탐지(측정 share / latency 2배 fallback / c=0 행 없음), 전부 skip된 입력, `fit_r2` 성질, synth→analyze end-to-end |
+| `test_runner.py` | GPU 비의존 부분 | 분류기 순서 의존성(어떤 것이 실제로 load-bearing인지), 키가 전부 소문자인지, NVML/capacity 조회, plan CLI와 runner의 base_c·capacity gate 일치 |
+| `test_selftest.py` | §7 검증을 테스트로 | selftest의 3개 검사를 CI에서도 실패하게 |
+
+## 9. 해석 가이드
 
 **효과 분해** (Exp2–4, homogeneous / ρ≈0 기준 대비):
 
 ```
-latency_ratio  = work_ratio × (1 / tflops_ratio)
-                 ────────────   ───────────────
-                 AI 효과         kernel efficiency 효과
-                 (Σn_i(c_i+n_i/2) 변화, scheduler가 계산 가능)   (tile imbalance 등, 잔차)
+latency_ratio  =  flops_ratio  ×  (1 / tflops_ratio)      ← 항등식 (정확)
+                  ───────────      ────────────────
+                  분석적 work 증가    kernel efficiency 하락
+                  (scheduler가 예측 가능)   (tile imbalance 등, 잔차)
+
+work_ratio = Σn_i(c_i+n_i/2) 비율 = flops_ratio의 attention 부분
+             (attention-dominant 영역에서만 flops_ratio ≈ work_ratio)
 ```
 
-`work_ratio`로 설명되는 부분은 scheduler가 `(Σn, Σc, Σn², Σnc, B)`만으로 예측할 수
-있고, `tflops_ratio`로 남는 부분이 cost model이 놓치는 잔차다.
+`achieved_tflops = est_flops_total / latency`이므로 위 분해는 **항등식**이다 — 독립적인
+검증이 아니라, 관측된 latency 변화를 "분석적으로 예측 가능한 work 증가"와 "설명되지
+않는 효율 하락"으로 **귀속(attribution)** 하는 것이다. `flops_ratio`로 설명되는 부분은
+scheduler가 `(Σn, Σc, Σn², Σnc, B)`만으로 예측할 수 있고, `tflops_ratio`로 남는 부분이
+cost model이 놓치는 잔차다.
 
 **Exp2에서 잔차가 나올 것으로 예상되는 메커니즘**: vLLM의 FA2 varlen 커널은 grid를
 `ceil(max_i n_i / 64) × B × H`로 잡고, 자기 request 길이를 넘는 block은 early-exit한다.

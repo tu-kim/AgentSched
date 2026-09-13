@@ -251,13 +251,15 @@ MODEL_PRESETS = {
                               max_position=131072, tied_embeddings=True, n_experts=40, top_k=8, moe_inter=512),
     "qwen3-30b-a3b": _spec(48, 2048, 32, 4, 128, 6144, 151936, name="Qwen/Qwen3-30B-A3B", max_position=40960,
                            n_experts=128, top_k=8, moe_inter=768),          # 61 GB bf16: ~90K KV tokens on 80GB
-    # ---- MLA + MoE (only registry-native MLA model that fits one 80GB GPU)
-    "deepseek-v2-lite": _spec(27, 2048, 16, 16, 192, 10944, 102400, name="deepseek-ai/DeepSeek-V2-Lite", max_position=163840,
+    # ---- MLA + MoE (only registry-native MLA model that fits one 80GB GPU).
+    #      head_dim is unused under MLA (d_qk/d_v come from the MLA dims); it is set to
+    #      hidden/heads so the preset equals what from_hf_config() derives from config.json.
+    "deepseek-v2-lite": _spec(27, 2048, 16, 16, 128, 10944, 102400, name="deepseek-ai/DeepSeek-V2-Lite", max_position=163840,
                               kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128, v_head_dim=128,
                               n_experts=64, top_k=6, moe_inter=1408, shared_inter=2 * 1408, n_dense_layers=1),
     # ---- MLA dense: no public checkpoint runs natively in vLLM; synthetic DeepseekV2 config
     #      matched to qwen1.5-1.8b (bench/synthetic_configs/mla-dense-1.8b, --load-format dummy)
-    "mla-dense-1.8b": _spec(24, 2048, 16, 16, 192, 5504, 151936, name="synthetic/mla-dense-1.8b", max_position=32768,
+    "mla-dense-1.8b": _spec(24, 2048, 16, 16, 128, 5504, 151936, name="synthetic/mla-dense-1.8b", max_position=32768,
                             kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128, v_head_dim=128),
 }
 
@@ -325,20 +327,21 @@ def estimate_flops_bytes(spec: ModelSpec, pairs):
 
     flops_total = flops_linear + flops_attn
     bytes_analytic = weight_traffic + attn_bytes
+    ratio = lambda a, b: a / b if b else 0.0          # an empty batch is 0 work, not a crash
     return dict(
         est_flops_linear=flops_linear,
         est_flops_attn=flops_attn,
         est_flops_total=flops_total,
-        est_attn_flop_frac=flops_attn / flops_total,
+        est_attn_flop_frac=ratio(flops_attn, flops_total),
         est_weight_bytes=weight_traffic,
         est_kv_read_bytes=kv_read,
         est_attn_bytes=attn_bytes,
         est_act_bytes_approx=act_bytes,
         est_bytes_analytic=bytes_analytic,
         est_bytes_total=bytes_analytic + act_bytes,
-        est_ai_attn=flops_attn / attn_bytes if attn_bytes else 0.0,
-        est_ai_analytic=flops_total / bytes_analytic,
-        est_arith_intensity=flops_total / (bytes_analytic + act_bytes),
+        est_ai_attn=ratio(flops_attn, attn_bytes),
+        est_ai_analytic=ratio(flops_total, bytes_analytic),
+        est_arith_intensity=ratio(flops_total, bytes_analytic + act_bytes),
     )
 
 

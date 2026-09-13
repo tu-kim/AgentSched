@@ -55,9 +55,11 @@ KERNEL_CASES = [
 
     # ---- KV cache writes: contain 'flash'/'mla', must not be counted as attention
     ("void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, __nv_bfloat16,"
-     " (vllm::Fp8KVCacheDataType)0>(...)", "kvcache", "dense KV write — contains 'flash'"),
+     " (vllm::Fp8KVCacheDataType)0>(...)", "kvcache",
+     "dense KV write — safe only because the attention keys are 'flash::'/'flash_fwd', not 'flash'"),
     ("void vllm::concat_and_cache_mla_kernel<__nv_bfloat16, __nv_bfloat16,"
-     " (vllm::Fp8KVCacheDataType)0>(...)", "kvcache", "MLA latent write — contains '_mla'"),
+     " (vllm::Fp8KVCacheDataType)0>(...)", "kvcache",
+     "MLA latent write — matches the '_mla' attention key, so KVCACHE must be checked first"),
 
     # ---- MoE
     ("fused_moe_kernel", "moe", "Triton expert GEMM (the bulk of MoE time)"),
