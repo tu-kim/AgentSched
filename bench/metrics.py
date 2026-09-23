@@ -564,14 +564,78 @@ CONTROLLED_PAIRS = {
     "dsa-off-vs-on": ("deepseek-v3", "deepseek-v3.2", "only the sparse-attention indexer"),
 }
 
-# (peak dense bf16 FLOP/s, HBM byte/s) for roofline reference lines
-DEVICE_PEAKS = {
-    "A100-80GB": (312e12, 2.039e12),       # SXM
-    "A100-80GB-PCIe": (312e12, 1.935e12),
-    "H100-SXM": (989e12, 3.35e12),
-    "H100-PCIe": (756e12, 2.0e12),
-    "H200": (989e12, 4.8e12),
+@dataclass(frozen=True)
+class DeviceSpec:
+    """What the analytic model needs to know about the GPU.
+
+    The compute capability decides the FlashAttention version vLLM selects, and
+    that in turn decides whether the MLA prefill path has to zero-pad V (only
+    FA3 on SM90 and FA4 on SM100 accept differing QK/V head dims) and whether an
+    fp8 KV cache is usable with the FLASH_ATTN backend.
+    """
+    name: str
+    peak_bf16_flops: float
+    hbm_bytes_per_s: float
+    mem_gib: float
+    capability: tuple
+
+    @property
+    def fa_version(self):
+        major = self.capability[0]
+        return 4 if major >= 10 else (3 if major == 9 else 2)
+
+    @property
+    def mla_v_padded(self):
+        return self.fa_version < 3
+
+    @property
+    def supports_fp8_kv_with_flash_attn(self):
+        return self.fa_version >= 3
+
+    @property
+    def peaks(self):
+        return (self.peak_bf16_flops, self.hbm_bytes_per_s)
+
+
+DEVICES = {
+    "A100-80GB":      DeviceSpec("A100-80GB", 312e12, 2.039e12, 80, (8, 0)),      # SXM
+    "A100-80GB-PCIe": DeviceSpec("A100-80GB-PCIe", 312e12, 1.935e12, 80, (8, 0)),
+    "A100-40GB":      DeviceSpec("A100-40GB", 312e12, 1.555e12, 40, (8, 0)),
+    "H100-SXM":       DeviceSpec("H100-SXM", 989e12, 3.35e12, 80, (9, 0)),
+    "H100-PCIe":      DeviceSpec("H100-PCIe", 756e12, 2.0e12, 80, (9, 0)),
+    "H200":           DeviceSpec("H200", 989e12, 4.8e12, 141, (9, 0)),
+    "B200":           DeviceSpec("B200", 2250e12, 8.0e12, 180, (10, 0)),
 }
+DEFAULT_DEVICE = "A100-80GB"
+
+# (peak dense bf16 FLOP/s, HBM byte/s) — kept for roofline call sites
+DEVICE_PEAKS = {k: d.peaks for k, d in DEVICES.items()}
+
+
+def detect_device(fallback=DEFAULT_DEVICE):
+    """Identify the GPU this process can see; falls back to a named default."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return DEVICES[fallback]
+        props = torch.cuda.get_device_properties(0)
+        cap = (props.major, props.minor)
+        mem_gib = props.total_memory / 2**30
+        for d in DEVICES.values():
+            if d.capability == cap and abs(d.mem_gib - mem_gib) < 12:
+                return d
+        # unknown board: keep the real numbers, borrow peaks from the closest family
+        near = min(DEVICES.values(), key=lambda d: (d.capability != cap, abs(d.mem_gib - mem_gib)))
+        return DeviceSpec(props.name, near.peak_bf16_flops, near.hbm_bytes_per_s, mem_gib, cap)
+    except Exception:
+        return DEVICES[fallback]
+
+
+def for_device(spec: ModelSpec, device: DeviceSpec):
+    """Adjust a model spec to the kernels a given GPU will actually run."""
+    if spec.attn_type == "mla" and spec.mla_v_padded != device.mla_v_padded:
+        return replace(spec, mla_v_padded=device.mla_v_padded)
+    return spec
 
 
 def estimate_flops_bytes(spec: ModelSpec, pairs):

@@ -284,27 +284,34 @@ def resolve_base_c(arg, spec):
 # ---------------------------------------------------------------- plan CLI
 def _main():
     import argparse
-    from bench.metrics import MODEL_PRESETS, estimate_flops_bytes
+    from bench.metrics import DEVICES, MODEL_PRESETS, estimate_flops_bytes, for_device
     ap = argparse.ArgumentParser(description="List configs; check feasibility for a model/GPU.")
     ap.add_argument("--exp", nargs="+", default=list(GENERATORS))
     ap.add_argument("--base-c", default="auto", help="int, or 'auto' = next pow2 ≥ analytic c* (as runner)")
     ap.add_argument("--model", default="qwen1.5-1.8b", help=f"preset: {list(MODEL_PRESETS)}")
-    ap.add_argument("--gpu-mem-gib", type=float, default=80)
+    ap.add_argument("--gpu", default="A100-80GB", help=", ".join(DEVICES))
+    ap.add_argument("--gpu-mem-gib", type=float, default=None,
+                    help="override the device profile's memory size")
     ap.add_argument("--gpu-mem-util", type=float, default=0.90)
     ap.add_argument("--capacity-margin", type=float, default=0.95, help="same gate as runner")
     ap.add_argument("--tp", type=int, default=1)
     args = ap.parse_args()
 
-    spec = MODEL_PRESETS[args.model]
+    dev = DEVICES[args.gpu]
+    mem = args.gpu_mem_gib if args.gpu_mem_gib else dev.mem_gib
+    spec = for_device(MODEL_PRESETS[args.model], dev)
     base_c = resolve_base_c(args.base_c, spec)
-    cap = spec.kv_capacity_tokens(args.gpu_mem_gib, args.gpu_mem_util, tp=args.tp)
+    cap = spec.kv_capacity_tokens(mem, args.gpu_mem_util, tp=args.tp)
     gate = cap * args.capacity_margin
     cstar = {n: spec.attn_crossover_ctx(n) for n in (64, 1024, 8192)}
     print(f"model={spec.name} arch={spec.arch_label} params={spec.total_params/1e9:.2f}B "
-          f"kv_bytes/token={spec.kv_bytes_per_token/1024:.0f}KB")
+          f"kv_bytes/token={spec.kv_bytes_per_token/1024:.0f}KB  "
+          f"device={dev.name} FA{dev.fa_version}"
+          + (f" (MLA V padding {'on' if spec.mla_v_padded else 'off'})"
+             if spec.attn_type == 'mla' else ""))
     print(f"analytic c* (attn FLOPs == linear FLOPs): " +
           ", ".join(f"n={n}: {v:,.0f}" for n, v in cstar.items()) + f"  → base_c={base_c}")
-    print(f"est. KV capacity on {args.gpu_mem_gib:.0f}GiB×{args.tp} @util {args.gpu_mem_util}: {cap:,d} tokens "
+    print(f"est. KV capacity on {mem:.0f}GiB×{args.tp} @util {args.gpu_mem_util}: {cap:,d} tokens "
           f"(gate {args.capacity_margin:.2f}× = {gate:,.0f})\n")
     print(f"{'exp':5s} {'name':26s} {'B':>4s} {'cv_n':>5s} {'cv_c':>5s} {'rho':>5s} "
           f"{'kv_tokens':>10s} {'attnFLOP%':>9s} {'AI_attn':>8s} fits")

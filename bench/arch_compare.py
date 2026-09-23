@@ -21,7 +21,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from bench.metrics import CONTROLLED_PAIRS, MODEL_PRESETS, estimate_flops_bytes
+from bench.metrics import (CONTROLLED_PAIRS, DEVICES, MODEL_PRESETS,
+                           estimate_flops_bytes, for_device)
 
 # one representative per taxonomy family that fits a single 80GB GPU
 DEFAULT = ["llama2-7b", "falcon-7b", "llama3-8b", "gemma3-4b",
@@ -34,13 +35,13 @@ def fmt(v):
     return "inf" if v == math.inf else f"{v:,.0f}"
 
 
-def table(keys, gpu_mem_gib, util):
+def table(keys, dev, gpu_mem_gib, util):
     """Family table: what each architecture changes, per phase."""
     lines = [f"{'preset':22s} {'family':11s} {'arch':16s} {'tier':12s} {'params':>8s} "
              f"{'active':>8s} {'KV/tok':>9s} {'KVcap':>12s} {'c*(dec)':>10s} {'c*(pre)':>10s} "
              f"{'AI_dec@32K':>11s}"]
     for key in keys:
-        s = MODEL_PRESETS[key]
+        s = for_device(MODEL_PRESETS[key], dev)
         cap = s.kv_capacity_tokens(gpu_mem_gib, util)
         ai = estimate_flops_bytes(s, [(1, 32768)])["est_ai_attn"]
         lines.append(
@@ -54,10 +55,10 @@ def table(keys, gpu_mem_gib, util):
     return lines
 
 
-def pair_table(gpu_mem_gib, util):
+def pair_table(dev, gpu_mem_gib, util):
     lines = ["", "Controlled pairs (one structural change each):"]
     for name, (a, b, why) in CONTROLLED_PAIRS.items():
-        sa, sb = MODEL_PRESETS[a], MODEL_PRESETS[b]
+        sa, sb = for_device(MODEL_PRESETS[a], dev), for_device(MODEL_PRESETS[b], dev)
         ai_a = estimate_flops_bytes(sa, [(1, 32768)])["est_ai_attn"]
         ai_b = estimate_flops_bytes(sb, [(1, 32768)])["est_ai_attn"]
         lines.append(f"  {name:22s} {a} → {b}")
@@ -71,11 +72,11 @@ def pair_table(gpu_mem_gib, util):
     return lines
 
 
-def plot(keys, outdir):
+def plot(keys, dev, outdir):
     M = len(keys)
     fig, axes = plt.subplots(3, M, figsize=(4.3 * M, 11.5), squeeze=False)
     for j, key in enumerate(keys):
-        s = MODEL_PRESETS[key]
+        s = for_device(MODEL_PRESETS[key], dev)
         x = [max(c, 100) for c in CS]
         # row 0 — prefill attention share
         for n in PREFILL_NS:
@@ -116,18 +117,26 @@ def main():
     ap.add_argument("--models", nargs="+", default=DEFAULT)
     ap.add_argument("--pairs", action="store_true", help="also print the controlled-pair table")
     ap.add_argument("--all", action="store_true", help="table for every preset")
-    ap.add_argument("--gpu-mem-gib", type=float, default=80)
+    ap.add_argument("--gpu", default="A100-80GB", help=", ".join(DEVICES))
+    ap.add_argument("--gpu-mem-gib", type=float, default=None,
+                    help="override the device profile's memory size")
     ap.add_argument("--gpu-mem-util", type=float, default=0.90)
     ap.add_argument("--outdir", default="results")
     args = ap.parse_args()
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    dev = DEVICES[args.gpu]
+    mem = args.gpu_mem_gib if args.gpu_mem_gib else dev.mem_gib
     keys = list(MODEL_PRESETS) if args.all else args.models
-    lines = table(keys, args.gpu_mem_gib, args.gpu_mem_util)
+    lines = [f"device: {dev.name}  cc{dev.capability[0]}.{dev.capability[1]}  "
+             f"{mem:.0f}GiB  {dev.peak_bf16_flops/1e12:.0f} TF/s bf16  "
+             f"{dev.hbm_bytes_per_s/1e12:.2f} TB/s  FA{dev.fa_version}"
+             + ("  (MLA V is zero-padded on this GPU)" if dev.mla_v_padded else ""), ""]
+    lines += table(keys, dev, mem, args.gpu_mem_util)
     if args.pairs or args.all:
-        lines += pair_table(args.gpu_mem_gib, args.gpu_mem_util)
-    plot(args.models, outdir)
+        lines += pair_table(dev, mem, args.gpu_mem_util)
+    plot(args.models, dev, outdir)
     (outdir / "arch_compare.txt").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
     print(f"\nWrote {outdir}/arch_compare.png, arch_compare.txt")

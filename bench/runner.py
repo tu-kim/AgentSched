@@ -28,6 +28,7 @@ import json
 import os
 import random
 import time
+from dataclasses import replace
 from pathlib import Path
 
 # Must be set before vllm is imported/constructed: with the default (1) the
@@ -37,7 +38,8 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 from bench.configs import (all_configs, group_by_shape, resolve_base_c, BLOCK_SIZE,
                            GENERATORS)
-from bench.metrics import ModelSpec, estimate_flops_bytes, NVMLSampler
+from bench.metrics import (DEVICES, ModelSpec, NVMLSampler, detect_device,
+                           estimate_flops_bytes, for_device)
 
 MAX_MODEL_LEN_PAD = 256
 
@@ -331,7 +333,10 @@ def main():
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--kernel-profile", action="store_true",
                     help="extra torch.profiler step per shape → attention/GEMM/MoE kernel time")
-    ap.add_argument("--device", type=int, default=0)
+    ap.add_argument("--device", type=int, default=0, help="CUDA-visible GPU index")
+    ap.add_argument("--gpu", default="A100-80GB",
+                    help="fallback device profile when detection fails: "
+                         + ", ".join(DEVICES))
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--gpu-mem-util", type=float, default=0.90)
     ap.add_argument("--capacity-margin", type=float, default=0.95)
@@ -379,6 +384,23 @@ def main():
     fa_ver = flash_attn_version()
     print(f"[engine] kv_capacity_tokens={capacity if capacity else 'unknown'} "
           f"attention_backend={backend} flash_attn_version={fa_ver}")
+    # The GPU decides which kernels run: FA2 below SM90 (MLA pads V to the QK head
+    # dim, no fp8 KV via FLASH_ATTN), FA3 on Hopper, FA4 on Blackwell. Trust the
+    # version vLLM resolved over the board name when they disagree.
+    dev = detect_device(args.gpu)
+    if fa_ver and fa_ver != dev.fa_version:
+        print(f"[device] {dev.name} implies FA{dev.fa_version} but vLLM resolved FA{fa_ver}; "
+              f"using FA{fa_ver} for the cost model")
+        dev = replace(dev, capability=(9, 0) if fa_ver == 3 else
+                      ((10, 0) if fa_ver == 4 else (8, 0)))
+    before = spec.mla_v_padded
+    spec = for_device(spec, dev)
+    print(f"[device] {dev.name} cc{dev.capability[0]}.{dev.capability[1]} "
+          f"{dev.mem_gib:.0f}GiB peak={dev.peak_bf16_flops/1e12:.0f}TF/s "
+          f"hbm={dev.hbm_bytes_per_s/1e12:.2f}TB/s FA{dev.fa_version}")
+    if spec.attn_type == "mla" and before != spec.mla_v_padded:
+        print(f"[model] MLA V padding {'on' if spec.mla_v_padded else 'off'} on this GPU "
+              f"→ attention FLOPs per pair {spec.attn_flops_per_pair(1024):,.0f}")
     sampler = NVMLSampler(args.device)         # fail fast if NVML is unavailable
     n_fit = sum(1 for c in cfgs if not capacity or c.kv_tokens_needed() <= capacity * args.capacity_margin)
     print(f"[plan] {n_fit}/{len(cfgs)} configs fit the KV cache; {len(shapes)} distinct shapes")
@@ -389,6 +411,10 @@ def main():
                       model_params=spec.total_params, model_active_params=spec.linear_params_active,
                       model_attn_crossover_ctx=cstar[1024], model_attn_crossover_by_n=cstar,
                       base_c=base_c, tp=args.tp, kv_capacity_tokens=capacity,
+                      device_name=dev.name, device_capability=list(dev.capability),
+                      device_peak_tflops=dev.peak_bf16_flops / 1e12,
+                      device_hbm_tbs=dev.hbm_bytes_per_s / 1e12,
+                      mla_v_padded=spec.mla_v_padded,
                       attention_backend=backend, flash_attn_version=fa_ver,
                       enforce_eager=args.enforce_eager, kv_cache_dtype=args.kv_cache_dtype or "auto",
                       load_format=args.load_format)

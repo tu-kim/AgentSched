@@ -9,8 +9,27 @@ execution cost를 어떻게 바꾸는지 측정한다.
 **핵심 가설**: `Σn_i`라는 단일 token budget만으로는 heterogeneous batch의 실제
 GPU execution cost를 표현할 수 없다.
 
-환경: 단일 GPU (A100 80GB 기준), expert parallelism 없음(MoE는 fused-MoE 단일 GPU
-경로; EP의 token dispatch 비용은 이 연구에서 제외).
+환경: 단일 GPU, expert parallelism 없음(MoE는 fused-MoE 단일 GPU 경로; EP의 token
+dispatch 비용은 이 연구에서 제외). **A100(SM80)과 H100(SM90) 양쪽에서 동작**하며,
+GPU에 따라 실제로 도는 커널이 달라지므로 분석 모델도 이를 따라간다.
+
+| | A100 (SM80) | H100 (SM90) |
+|---|---|---|
+| FlashAttention | FA2 | FA3 |
+| dense attention kernel | `flash_fwd_splitkv_kernel` | `cutlass::device_kernel<flash::…FlashAttnFwdSm90…>` |
+| MLA prefill의 V | **128→192 zero-pad** (FA2는 서로 다른 head dim 불가) | padding 없음 |
+| `--kv-cache-dtype fp8` + FLASH_ATTN | 불가 (backend auto로 전환) | 가능 |
+| peak bf16 / HBM | 312 TF/s / 2.04 TB/s | 989 TF/s / 3.35 TB/s |
+
+runner는 `torch.cuda`와 vLLM이 resolve한 FA 버전으로 GPU를 **자동 감지**해서
+`mla_v_padded`를 맞추고, device를 결과 행에 기록한다(`device_name`,
+`device_capability`, `device_peak_tflops`, `device_hbm_tbs`, `mla_v_padded`).
+`analyze`는 `--device auto`(기본)로 기록된 device의 roofline을 그린다. GPU 없는
+분석 도구는 `--gpu A100-80GB|H100-SXM|H200|B200|…`로 지정한다.
+
+MLA V padding 차이는 작지 않다 — DeepSeek-V2-Lite prefill 기준 pair당 attention
+FLOPs가 12,288(A100) 대 10,240(H100)으로 **1.2배**이고, 그만큼이 0에 대한 연산이다.
+c\*(prefill)도 9,751 → 11,217로 움직인다.
 
 ## 1. 왜 attention-dominant 영역인가
 
@@ -200,10 +219,10 @@ pip install "vllm==0.28.*" pynvml pandas matplotlib     # kernel 이름/API는 0
 cd AgentSched
 
 # 0. GPU 없이: 테스트 + 측정 검증 + 아키텍처 비교 + feasibility
-python -m unittest discover -s tests -t .                           # 131 tests, ~2s
+python -m unittest discover -s tests -t .                           # 137 tests, ~2s
 python -m bench.selftest                                            # §7, 항상 먼저
-python -m bench.arch_compare --pairs --gpu-mem-gib 80                # 계열표 + 통제 쌍
-python -m bench.configs --model qwen1.5-1.8b --gpu-mem-gib 80        # base_c auto, gate 0.95
+python -m bench.arch_compare --pairs --gpu H100-SXM                  # 계열표 + 통제 쌍 (또는 --gpu A100-80GB)
+python -m bench.configs --model qwen1.5-1.8b --gpu H100-SXM          # base_c auto, gate 0.95
 
 # 1. c* 찾기 (모델별)
 python -m bench.runner --model Qwen/Qwen1.5-1.8B --exp exp0 --kernel-profile
@@ -230,7 +249,9 @@ python -m bench.runner --model Qwen/Qwen1.5-1.8B --exp exp5 --kernel-profile
 #   --model bench/synthetic_configs/kv-mqa-1.8b  --load-format dummy
 #   --model bench/synthetic_configs/swa-1.8b     --load-format dummy
 #   --model bench/synthetic_configs/mla-dense-1.8b --load-format dummy
-# 옵션: --load-format dummy (random weight, 다운로드 없음), --kv-cache-dtype fp8
+# 옵션: --load-format dummy (random weight, 다운로드 없음)
+#       --kv-cache-dtype fp8 (Hopper+ 권장 — A100은 backend auto로 전환)
+#       --gpu <profile> (감지 실패 시 fallback; 보통 불필요)
 ```
 
 환경 메모: A100(SM80)에서는 FA2가 사용되고(FA3는 Hopper 전용), MLA 모델에

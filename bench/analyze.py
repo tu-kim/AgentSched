@@ -22,7 +22,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from bench.configs import DECODE_EXPS, PREFILL_EXPS
-from bench.metrics import DEVICE_PEAKS
+from bench.metrics import DEFAULT_DEVICE, DEVICE_PEAKS
 
 KERNEL_CLASSES = ["attention", "gemm", "moe", "activation", "kvcache", "other"]
 
@@ -320,7 +320,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", nargs="+", default=["results/raw.jsonl"])
     ap.add_argument("--outdir", default="results")
-    ap.add_argument("--device", default="A100-80GB", help=f"roofline reference: {list(DEVICE_PEAKS)}")
+    ap.add_argument("--device", default="auto",
+                    help=f"roofline reference; 'auto' uses the device recorded in "
+                         f"raw.jsonl. One of: {list(DEVICE_PEAKS)}")
     args = ap.parse_args()
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -329,6 +331,13 @@ def main():
         print(f"No measured configs. Skipped {len(skipped)}:")
         print("\n".join(f"  {m} {e}/{n}: {r}" for m, e, n, r in skipped))
         return
+    device = args.device
+    if device == "auto":
+        recorded = [d for d in df.get("device_name", pd.Series(dtype=object)).dropna().unique()
+                    if d in DEVICE_PEAKS]
+        device = recorded[0] if recorded else DEFAULT_DEVICE
+        if len(recorded) > 1:
+            print(f"! results span several devices {recorded}; roofline drawn for {device}")
     df = add_efficiency_columns(df)
     df.drop(columns=[c for c in ["latency_all_s", "pairs", "kernel_top", "kernel_unclassified",
                                  "model_attn_crossover_by_n"]
@@ -336,7 +345,7 @@ def main():
 
     lines = []
     cstar = analyze_exp0(df, outdir, lines)
-    plot_exp1(df, outdir, args.device)
+    plot_exp1(df, outdir, device)
     plot_hetero(df, "exp2", "cv_n", "Exp2: CV(n) @ Σn=8192, B=8", outdir, lines)
     plot_hetero(df, "exp3", "cv_c", "Exp3: CV(c) @ n=1024, B=8 (AI-neutral control)", outdir, lines)
     plot_exp4(df, outdir, lines)

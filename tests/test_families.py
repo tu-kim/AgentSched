@@ -253,3 +253,55 @@ class TestPresetHygiene(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeviceProfiles(unittest.TestCase):
+    """The benchmark must run on A100 (SM80/FA2) and H100 (SM90/FA3) alike, and
+    the analytic model has to follow whichever kernels that GPU will use."""
+
+    def test_fa_version_follows_compute_capability(self):
+        from bench.metrics import DEVICES
+        self.assertEqual(DEVICES["A100-80GB"].fa_version, 2)
+        self.assertEqual(DEVICES["H100-SXM"].fa_version, 3)
+        self.assertEqual(DEVICES["H200"].fa_version, 3)
+        self.assertEqual(DEVICES["B200"].fa_version, 4)
+
+    def test_only_pre_hopper_pads_mla_v(self):
+        from bench.metrics import DEVICES
+        self.assertTrue(DEVICES["A100-80GB"].mla_v_padded)
+        self.assertFalse(DEVICES["H100-SXM"].mla_v_padded)
+        self.assertFalse(DEVICES["A100-80GB"].supports_fp8_kv_with_flash_attn)
+        self.assertTrue(DEVICES["H100-SXM"].supports_fp8_kv_with_flash_attn)
+
+    def test_for_device_adjusts_mla_and_leaves_others_alone(self):
+        from bench.metrics import DEVICES, for_device
+        a100, h100 = DEVICES["A100-80GB"], DEVICES["H100-SXM"]
+        mla = MODEL_PRESETS["deepseek-v2-lite"]
+        on_a100, on_h100 = for_device(mla, a100), for_device(mla, h100)
+        self.assertTrue(on_a100.mla_v_padded)
+        self.assertFalse(on_h100.mla_v_padded)
+        # padding V from 128 to 192 is arithmetic on zeros: ~1.2× the FLOPs per pair
+        self.assertAlmostEqual(on_a100.attn_flops_per_pair(1024)
+                               / on_h100.attn_flops_per_pair(1024), 384 / 320, places=6)
+        # non-MLA models are unaffected and returned unchanged
+        for key in ("llama2-7b", "falcon-7b", "gemma3-4b", "qwen1.5-moe-a2.7b"):
+            self.assertIs(for_device(MODEL_PRESETS[key], h100), MODEL_PRESETS[key])
+
+    def test_decode_path_is_device_independent_for_mla(self):
+        """Weight absorption never materialises V, so padding cannot apply."""
+        from bench.metrics import DEVICES, for_device
+        mla = MODEL_PRESETS["deepseek-v2-lite"]
+        a = for_device(mla, DEVICES["A100-80GB"]).attn_flops_per_pair(1)
+        h = for_device(mla, DEVICES["H100-SXM"]).attn_flops_per_pair(1)
+        self.assertEqual(a, h)
+
+    def test_device_peaks_stay_in_sync_with_the_profiles(self):
+        from bench.metrics import DEVICES, DEVICE_PEAKS
+        self.assertEqual(set(DEVICES), set(DEVICE_PEAKS))
+        for k, d in DEVICES.items():
+            self.assertEqual(DEVICE_PEAKS[k], (d.peak_bf16_flops, d.hbm_bytes_per_s))
+
+    def test_detect_device_falls_back_without_cuda(self):
+        from bench.metrics import DEVICES, detect_device
+        self.assertEqual(detect_device("H100-SXM").name, "H100-SXM")
+        self.assertIn(detect_device().name, {d.name for d in DEVICES.values()} | {"unknown"})

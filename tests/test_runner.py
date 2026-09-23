@@ -156,9 +156,18 @@ class TestEngineIntrospection(unittest.TestCase):
         self.assertIsNone(kv_capacity_tokens(self._engine(None)))
         self.assertIsNone(kv_capacity_tokens(self._engine(0)))
 
-    def test_flash_attn_version_without_vllm(self):
-        """Importable and non-raising on a machine with no vLLM installed."""
-        self.assertIsNone(flash_attn_version())
+    def test_flash_attn_version_is_reported_or_none(self):
+        """Contract: return the FA version vLLM resolved, or None when it cannot
+        be determined (no vLLM, no CUDA, ROCm) — never raise. The value is
+        recorded in raw.jsonl because it decides the kernel names, whether MLA
+        pads V, and whether fp8 KV is available.
+
+        vLLM picks 3 only on SM90 (Hopper) and 4 on SM100 (Blackwell); an A100
+        reports 2. A mismatch with the GPU you think you are on is worth
+        checking before trusting a measurement run.
+        """
+        v = flash_attn_version()
+        self.assertIn(v, (None, 2, 3, 4), f"unexpected FlashAttention version {v!r}")
 
 
 class TestFeasibilityGate(unittest.TestCase):
