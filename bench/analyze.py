@@ -21,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from bench.configs import DECODE_EXPS, PREFILL_EXPS
 from bench.metrics import DEVICE_PEAKS
 
 KERNEL_CLASSES = ["attention", "gemm", "moe", "activation", "kvcache", "other"]
@@ -242,30 +243,77 @@ MODELS = [
 ]
 
 
+def plot_exp5(df, outdir, lines):
+    """Decode: latency and attention intensity vs context and batch size."""
+    d = df[df.exp == "exp5"]
+    if d.empty:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
+    lines.append("== Exp5: decode (n_i = 1) ==")
+    lines.append(f"  {'model':22s} {'B':>5s} {'c':>8s} {'lat[ms]':>9s} {'tok/s':>9s} "
+                 f"{'KVread[MB]':>11s} {'AI_attn':>8s}")
+    for m, md in d.groupby("model_short"):
+        for B, bd in md.groupby("batch_size"):
+            bd = bd.sort_values("mean_c")
+            axes[0].plot(bd.mean_c.clip(lower=128), bd.latency_median_s * 1e3, "o-",
+                         label=f"{m} B={B}")
+            axes[1].plot(bd.mean_c.clip(lower=128), bd.throughput_tok_s, "o-", label=f"{m} B={B}")
+        for c, cd in md.groupby("mean_c"):
+            cd = cd.sort_values("batch_size")
+            axes[2].plot(cd.batch_size, cd.throughput_tok_s, "s--", label=f"{m} c={int(c)}")
+        for _, r in md.sort_values(["batch_size", "mean_c"]).iterrows():
+            lines.append(f"  {m:22s} {r.batch_size:5d} {int(r.mean_c):8d} "
+                         f"{r.latency_median_s*1e3:9.2f} {r.throughput_tok_s:9.0f} "
+                         f"{r.est_kv_read_bytes/1e6:11.1f} {r.est_ai_attn:8.2f}")
+    axes[0].set_xlabel("context c per request"); axes[0].set_ylabel("step latency [ms]")
+    axes[1].set_xlabel("context c per request"); axes[1].set_ylabel("decode throughput [tok/s]")
+    axes[2].set_xlabel("batch size B"); axes[2].set_ylabel("decode throughput [tok/s]")
+    axes[0].set_xscale("log", base=2); axes[1].set_xscale("log", base=2)
+    axes[2].set_xscale("log", base=2)
+    for ax in axes:
+        ax.grid(alpha=.3); ax.legend(fontsize=6)
+    fig.suptitle("Exp5: decode — attention scales with c, FFN/MoE with B")
+    fig.tight_layout(); fig.savefig(outdir / "exp5_decode.png", dpi=150)
+
+
 def hypothesis(df, cstar, lines):
+    """Cost-model fits, reported per model AND per phase.
+
+    Prefill and decode are never pooled: they are different kernels with
+    different bottlenecks, and a fit across both would be dominated by the phase
+    indicator rather than by batch shape.
+    """
     for m, dm in df.groupby("model_short"):
-        d = dm.dropna(subset=["latency_median_s"]).drop_duplicates("shape_key")
-        lines.append(f"== [{m}] fixed-budget spread (Σn = 8192, distinct shapes) ==")
-        fb = d[d.token_budget == 8192]
-        if len(fb) > 1:
-            lines.append(f"  shapes: {len(fb)}  latency min={fb.latency_median_s.min()*1e3:.1f}ms "
-                         f"max={fb.latency_median_s.max()*1e3:.1f}ms  "
-                         f"ratio={fb.latency_median_s.max()/fb.latency_median_s.min():.1f}×  "
-                         f"CV={fb.latency_median_s.std()/fb.latency_median_s.mean():.2f}")
-        lines.append(f"== [{m}] cost-model fit: latency ~ linear in features (+intercept), distinct shapes ==")
-        for label, cols in MODELS:
-            if len(d) > len(cols) + 2:
-                r2, _ = fit_r2(d, cols)
-                lines.append(f"  all ({len(d):3d})     R²({label:28s}) = {r2:.4f}")
-        cs = [c for (mm, _), (c, _) in cstar.items() if mm == m and c is not None]
-        if cs:
-            thr = min(cs)
-            ad = d[d.mean_c >= thr]
-            lines.append(f"  -- attention-dominant subset (mean c ≥ c*={thr}): {len(ad)} shapes")
+        for phase, exps in (("prefill", PREFILL_EXPS), ("decode", DECODE_EXPS)):
+            dp = dm[dm.exp.isin(exps)]
+            d = dp.dropna(subset=["latency_median_s"]).drop_duplicates("shape_key")
+            if len(d) < 4:
+                continue
+            lines.append(f"== [{m}] {phase}: cost-model fit "
+                         f"(latency ~ linear in features + intercept, distinct shapes) ==")
+            if phase == "prefill":
+                fb = d[d.token_budget == 8192]
+                if len(fb) > 1:
+                    lines.append(f"  fixed budget Σn=8192: {len(fb)} shapes, latency "
+                                 f"{fb.latency_median_s.min()*1e3:.1f}–"
+                                 f"{fb.latency_median_s.max()*1e3:.1f}ms "
+                                 f"({fb.latency_median_s.max()/fb.latency_median_s.min():.1f}× "
+                                 f"spread, CV={fb.latency_median_s.std()/fb.latency_median_s.mean():.2f})")
             for label, cols in MODELS:
-                if len(ad) > len(cols) + 2:
-                    r2, _ = fit_r2(ad, cols)
-                    lines.append(f"  c ≥ c* ({len(ad):3d})  R²({label:28s}) = {r2:.4f}")
+                if len(d) > len(cols) + 2:
+                    r2, _ = fit_r2(d, cols)
+                    lines.append(f"  all ({len(d):3d})     R²({label:28s}) = {r2:.4f}")
+            if phase != "prefill":
+                continue
+            cs = [c for (mm, _), (c, _) in cstar.items() if mm == m and c is not None]
+            if cs:
+                thr = min(cs)
+                ad = d[d.mean_c >= thr]
+                lines.append(f"  -- attention-dominant subset (mean c ≥ c*={thr}): {len(ad)} shapes")
+                for label, cols in MODELS:
+                    if len(ad) > len(cols) + 2:
+                        r2, _ = fit_r2(ad, cols)
+                        lines.append(f"  c ≥ c* ({len(ad):3d})  R²({label:28s}) = {r2:.4f}")
 
 
 def main():
@@ -292,6 +340,7 @@ def main():
     plot_hetero(df, "exp2", "cv_n", "Exp2: CV(n) @ Σn=8192, B=8", outdir, lines)
     plot_hetero(df, "exp3", "cv_c", "Exp3: CV(c) @ n=1024, B=8 (AI-neutral control)", outdir, lines)
     plot_exp4(df, outdir, lines)
+    plot_exp5(df, outdir, lines)
     hypothesis(df, cstar, lines)
     bad = df[~(df.get("co_scheduled", True).astype(bool) & df.get("cache_hits_ok", True).astype(bool))]
     if len(bad):

@@ -151,19 +151,29 @@ class TestDerivedProperties(unittest.TestCase):
         self.assertEqual(unpadded.d_v, 128)
         self.assertLess(unpadded.attn_flops_per_token_per_ctx, mla.attn_flops_per_token_per_ctx)
 
-    def test_attn_crossover_is_n_independent_for_mha_and_gqa(self):
-        for key in ("qwen1.5-1.8b", "qwen3-1.7b", "qwen1.5-moe-a2.7b"):
+    def test_attn_crossover_for_mha_and_gqa_shifts_only_by_the_causal_offset(self):
+        """For a uniform full-attention stack the crossover in *attended* context
+        is a model constant; in cached context it just slides by (n+1)/2."""
+        for key in ("qwen1.5-1.8b", "qwen3-1.7b", "llama2-7b", "falcon-7b"):
             spec = MODEL_PRESETS[key]
-            values = {round(spec.attn_crossover_ctx(n), 6) for n in (16, 64, 1024, 8192)}
-            self.assertEqual(len(values), 1, key)
+            attended = {round(spec.attn_crossover_ctx(n) + (n + 1) / 2)
+                        for n in (1, 16, 64, 1024, 8192)}
+            self.assertLessEqual(max(attended) - min(attended), 1, key)
 
-    def test_attn_crossover_grows_with_n_for_mla(self):
-        """MLA decompression is ∝ Σc but independent of n, so small-n batches
-        become attention-dominant at a much shorter context."""
+    def test_mla_crossover_is_phase_dependent(self):
+        """MLA is the one family where the decode and prefill kernels differ in
+        kind, so c* cannot be quoted as a single number."""
         mla = MODEL_PRESETS["deepseek-v2-lite"]
-        cstars = [mla.attn_crossover_ctx(n) for n in (16, 64, 1024, 8192)]
-        self.assertEqual(cstars, sorted(cstars))
-        self.assertLess(cstars[0], cstars[-1] / 3)
+        decode, prefill = mla.attn_crossover_ctx(1), mla.attn_crossover_ctx(1024)
+        self.assertLess(decode, prefill / 1.5)
+        mha = MODEL_PRESETS["qwen1.5-1.8b"]
+        self.assertAlmostEqual(mha.attn_crossover_ctx(1) / mha.attn_crossover_ctx(1024),
+                               1.0, places=1)
+
+    def test_local_layers_delay_or_remove_the_crossover(self):
+        full = MODEL_PRESETS["kv-mha-1.8b"].attn_crossover_ctx(1024)
+        swa = MODEL_PRESETS["swa-1.8b"].attn_crossover_ctx(1024)
+        self.assertGreater(swa, 3 * full, "windowed layers stop contributing")
 
     def test_kv_capacity(self):
         spec = MODEL_PRESETS["qwen1.5-1.8b"]
@@ -254,11 +264,21 @@ class TestEstimateFlopsBytes(unittest.TestCase):
             self.assertAlmostEqual((with_ctx - without - core) / 65536, per_ctx, delta=1.0)
 
     def test_mla_kv_read_uses_latent_not_materialised_size(self):
-        e = estimate_flops_bytes(self.mla, [(1024, 65536)])
-        self.assertAlmostEqual(e["est_kv_read_bytes"],
-                               65536 * (512 + 64) * 2 * 27, places=3)
-        # but the attention kernel additionally sees the decompressed K/V
+        n, c = 1024, 65536
+        e = estimate_flops_bytes(self.mla, [(n, c)])
+        # the kernel reads the latent for every key it attends to: cached plus new
+        self.assertAlmostEqual(e["est_kv_read_bytes"], (c + n) * (512 + 64) * 2 * 27, places=3)
+        # in prefill the per-head K/V are additionally materialised from it
         self.assertGreater(e["est_attn_bytes"], 5 * e["est_kv_read_bytes"])
+
+    def test_mla_decode_skips_materialisation(self):
+        """Weight absorption means the decode path never expands the latent, so
+        its attention bytes are dominated by the latent read itself."""
+        dec = estimate_flops_bytes(self.mla, [(1, 65536)])
+        self.assertLess(dec["est_attn_bytes"], 1.2 * dec["est_kv_read_bytes"])
+        # and per-head score FLOPs grow, pushing decode towards compute
+        self.assertGreater(self.mla.attn_flops_per_pair(1),
+                           2 * self.mla.attn_flops_per_pair(1024))
 
     def test_zero_context_is_handled(self):
         e = estimate_flops_bytes(self.mha, [(64, 0)])

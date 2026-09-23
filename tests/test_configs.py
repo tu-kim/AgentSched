@@ -199,13 +199,36 @@ class TestGenerators(unittest.TestCase):
         only = all_configs(["exp3"], BASE_C)
         self.assertEqual({c.exp for c in only}, {"exp3"})
         every = all_configs(base_c=BASE_C)
-        self.assertEqual({c.exp for c in every}, {"exp0", "exp1", "exp2", "exp3", "exp4"})
+        self.assertEqual({c.exp for c in every},
+                         {"exp0", "exp1", "exp2", "exp3", "exp4", "exp5"})
         self.assertLess(len(group_by_shape(every)), len(every), "duplicate shapes should exist")
 
     def test_names_unique_within_experiment(self):
-        for exp in ("exp0", "exp1", "exp2", "exp3", "exp4"):
+        for exp in ("exp0", "exp1", "exp2", "exp3", "exp4", "exp5"):
             names = [c.name for c in all_configs([exp], BASE_C)]
             self.assertEqual(len(names), len(set(names)), exp)
+
+    def test_exp5_is_pure_decode(self):
+        """Decode is where the attention families differ; every request must
+        contribute exactly one query token."""
+        cfgs = all_configs(["exp5"], BASE_C)
+        self.assertTrue(cfgs)
+        for c in cfgs:
+            self.assertEqual(set(c.ns), {1})
+            self.assertEqual(c.stats()["token_budget"], c.batch_size)
+            self.assertEqual(len(set(c.cs)), 1)
+            self.assertEqual(c.cs[0] % BLOCK_SIZE, 0)
+        # a 2-D grid: batch size and context vary independently
+        self.assertEqual(sorted({c.batch_size for c in cfgs}), [1, 8, 32, 128, 512])
+        self.assertGreaterEqual(len({c.cs[0] for c in cfgs}), 5)
+
+    def test_prefill_and_decode_sets_are_disjoint(self):
+        from bench.configs import DECODE_EXPS, PREFILL_EXPS
+        prefill = all_configs(list(PREFILL_EXPS), BASE_C)
+        decode = all_configs(list(DECODE_EXPS), BASE_C)
+        self.assertTrue(all(min(c.ns) >= 16 for c in prefill))
+        self.assertTrue(all(set(c.ns) == {1} for c in decode))
+        self.assertEqual(set(PREFILL_EXPS) & set(DECODE_EXPS), set())
 
 
 if __name__ == "__main__":

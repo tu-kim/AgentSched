@@ -27,53 +27,97 @@ GEMM이 지배적인 영역(짧은 context)에서는 `Σn_i`만 봐도 충분하
 1. **Exp0**: attention이 GEMM을 넘어서는 context 길이 `c*`를 실측으로 찾는다.
 2. **Exp1–4**: `c ≥ c*` 영역에서 `(n_i, c_i)` 분포에 따른 batching 효율 변화를 관측한다.
 
-### 아키텍처별 attention–GEMM 균형 (분석 모델, `bench/arch_compare.py`)
+### prefill과 decode는 반드시 분리한다
 
-`c*`는 per-request attention-side FLOPs = linear FLOPs가 되는 cached context다.
-MHA/GQA에서는 `c* = P_active / (2·L·H·d)` 로 `n`, `B`와 무관한 모델 상수지만,
-MLA에서는 `n`에 의존한다 (아래).
+이 프레임워크에서 request는 `(n_i, c_i)`이므로 **decode는 `n_i = 1`인 특수 케이스**다.
+둘을 섞으면 안 되는 이유:
 
-| preset | arch | params (active) | KV/token | 80GiB KV 용량 | c\*(n=64) | c\*(n=1024) | c\*(n=8192) |
-|---|---|---|---|---|---|---|---|
-| Qwen1.5-1.8B | MHA | 1.84B | 192 KB | ≈ 364K | 12.4K | 12.4K | 12.4K |
-| Qwen3-1.7B | GQA ×2 | 1.72B | 112 KB | ≈ 625K | 12.3K | 12.3K | 12.3K |
-| Qwen2.5-3B | GQA ×8 | 3.09B | 36 KB | ≈ 1.87M | 18.8K | 18.8K | 18.8K |
-| Qwen1.5-MoE-A2.7B | MHA + MoE | 14.3B (2.1B) | 192 KB | ≈ 237K | 21.0K | 21.0K | 21.0K |
-| mla-dense-1.8b (synthetic) | MLA | 1.76B | 27 KB | ≈ 2.59M | **1.2K** | 5.8K | 7.4K |
-| DeepSeek-V2-Lite | MLA + MoE | 15.7B (2.2B) | 30 KB | ≈ 1.41M | **2.1K** | 10.1K | 13.0K |
+- **GQA/MQA/MLA는 prefill의 score FLOPs를 거의 바꾸지 않고 decode의 KV read만 바꾼다.**
+  합쳐서 재면 이 축의 효과가 통째로 가려진다. (위 표의 decode AI 1.0 → 4.0 → 70.8이
+  prefill에서는 전부 동일하다.)
+- **attention 비중은 c에 따라, MoE/FFN 비중은 B에 따라** 크게 움직인다. 한 지점의 비율로
+  모델을 비교할 수 없으므로 두 축을 각각 훑어야 한다(Exp0/Exp1이 prefill 쪽, Exp5가
+  decode 쪽의 2D sweep).
+- cost-model 회귀도 phase별로 따로 적합시킨다. 섞으면 phase 지시변수가 batch shape 효과를
+  압도한다.
 
-(HF `config.json`으로 검증한 값; 전부 ungated, vLLM registry 포함. `python -m bench.arch_compare`
-가 그림과 함께 재생성. 그 외 preset: Qwen1.5-0.5B, Qwen3-4B, Qwen2.5-1.5B, Llama-3.2-1B/3B,
-OLMoE-1B-7B, granite-3b-a800m, Qwen3-30B-A3B(61 GB → KV 90K로 부적합).)
+`bench/configs.py`의 `PREFILL_EXPS = (exp0…exp4)`, `DECODE_EXPS = (exp5,)`가 이 경계이고
+`analyze.py`가 phase별로 따로 보고한다.
 
-아키텍처 셀 구성 근거: Qwen1.5-MoE-A2.7B의 attention block(L24/H16/d128/hidden 2048)은
-Qwen1.5-1.8B와 동일해 **dense→MoE 차이가 FFN만으로 격리**된다. MLA-dense는 vLLM이 native로
-지원하는 public checkpoint가 없어(MiniCPM3는 vLLM에서 full K/V cache로 동작, Youtu/TransMLA는
-registry 밖) Qwen1.5-1.8B와 L/hidden/heads/FFN을 맞춘 **synthetic DeepseekV2 config +
-`--load-format dummy`** 로 채운다(`bench/synthetic_configs/mla-dense-1.8b`; timing은 weight 값과
-무관). MLA 수치는 A100의 FA2 경로(V를 192로 zero-pad) 기준이다.
+> **측정상 주의**: exp5의 "decode"는 `prefix(c) + 1 fresh token` 프롬프트를 prefix-cache
+> hit로 실행한 것이라, scheduler 상태(WAITING→첫 스케줄)는 실제 decode(RUNNING)와 다르다.
+> 다만 attention metadata는 `query_len = 1`로 동일하게 분류되므로 **커널 경로는 같다**
+> (MLA의 `reorder_batch_threshold = 1`도 이 기준). TBT SLO 같은 스케줄러 효과를 보려면
+> 별도의 실행 중 decode 실험이 필요하다.
 
-아키텍처 요소별로 균형이 움직이는 방향:
+### 아키텍처 계열 (분석 모델: `bench/arch_compare.py`)
 
-- **GQA (g = H/H_kv)**: attention FLOPs는 그대로, K·V bytes만 1/g. c\*는 거의 변하지
-  않지만 attention AI가 g배 올라가고 KV/token이 줄어 같은 GPU에서 훨씬 큰 c에 도달할
-  수 있다. 즉 GQA는 "memory capacity 문제"를 완화하지만 "Σn_i가 attention cost를
-  놓치는 문제"는 그대로다.
-- **MoE**: active params가 줄면 linear FLOPs가 줄어 c\*가 낮아지고(Qwen1.5-MoE처럼 공유
-  expert가 크면 반대), expert weight는 token이 하나라도 가면 전부 읽으므로 GEMM side에
-  **Σn과 무관한 floor**가 생긴다(Qwen1.5-MoE ≈ 25 GB, DeepSeek-V2-Lite ≈ 29 GB per
-  iteration → A100에서 12–15 ms). 단일 GPU에서는 Triton `fused_moe_kernel`이 쓰이고
-  tile config가 M=Σn으로 정해지므로 Σn 고정인 Exp1–4 안에서는 상수다(Exp0 budget sweep은
-  Σn//E > 128 경계에서 GROUP_SIZE_M이 바뀜). Attention 항은 변하지 않는다.
-- **MLA**: KV cache가 latent(`r + d_rope` per token)라 KV/token이 매우 작지만, vLLM의
-  prefill 경로는 prefix-hit된 latent를 64K-token chunk 단위로 gather → `kv_b_proj`로
-  **head별 K/V로 복원** → FA2(non-causal) → `merge_attn_states` 한다. 이 decompression
-  비용은 `2·r·H·(d_nope+d_v)·c` 로 **n과 무관하게 c에 비례**하므로 `n`이 작은
-  (multi-turn) request에서는 attention core보다 커진다. 그래서 c\*가 n=64에서 ≈2K,
-  n=8192에서 ≈13K로 달라진다 — MLA에서는 "attention-dominant" 경계 자체가 batch shape에
-  의존하고, cost model에 `Σc_i` 항이 추가로 필요하다(Exp3가 MLA에서는 AI-neutral이 아님).
-  복원된 K/V가 materialize되므로 attention bytes는 MHA와 비슷한 규모다. A100에서는
-  FA2가 서로 다른 head dim을 못 다뤄 V가 128→192로 zero-pad된다(`mla_v_padded`).
+측정 대상은 attention 구조를 한 단계씩 바꾸는 9개 계열이다. `tier`는 단일 A100 80GB에서
+측정 가능한지를 뜻한다 — `measurable`(실측), `multi_gpu`(tp≥2 필요), `analytic_only`(분석만).
+
+| # | 계열 | 대표 모델 | tier | params (active) | KV/token | c\*(decode) | c\*(prefill) | decode AI@32K |
+|---|---|---|---|---|---|---|---|---|
+| 1 | MHA | Llama-2-7B | ✅ | 6.74B | 512 KB | 24.7K | 24.2K | **1.0** |
+| 2 | MQA | Falcon-7B | ✅ | 7.22B | 8 KB | 22.8K | 22.3K | **70.8** |
+| 3 | GQA | Llama-3-8B | ✅ | 8.03B | 128 KB | 26.6K | 26.1K | **4.0** |
+| 4 | local/global SWA | Gemma-3-4B | ✅ | 4.55B (3.21B) | 20 KB | 150.7K | 150.2K | 2.0 |
+| 5 | MoE FFN | Mixtral-8x7B | ⚠️ tp≥2 | 46.7B (12.6B) | 128 KB | 48.1K | 47.6K | 4.0 |
+| 5′ | MoE FFN (단일 GPU) | Qwen1.5-MoE-A2.7B | ✅ | 14.3B (2.07B) | 192 KB | 21.0K | 20.5K | 1.0 |
+| 6 | MLA | DeepSeek-V2-Lite | ✅ | 15.7B (2.24B) | 30 KB | **4.8K** | **9.8K** | 30.2 |
+| 7 | sparse (DSA) | DeepSeek-V3.2 | 📐 | 671B (35.7B) | 69 KB | 36.6K | 54.5K | 4.1 |
+| 8 | linear hybrid | Qwen3-Next-80B-A3B | ⚠️ | 79.3B (2.84B) | 24 KB | 28.5K | 28.0K | — |
+| 9 | 압축+sparse | DeepSeek-V4-Flash | ❌ | — | — | — | — | — |
+
+HF `config.json`으로 검증한 값(계열 9는 사양 미확인 — 아래 참조). `python -m bench.arch_compare
+--pairs`가 표·그림·통제 쌍을 재생성한다. `KV/token`은 **한계 증가율**이라 계열 4·8에서는
+window·recurrent 층이 빠져 층 수보다 훨씬 작다(Gemma-3: 34층 중 global 5층만 증가).
+
+**계열별로 무엇이 바뀌는가** (decode AI = attention FLOP/byte):
+
+- **1→2→3 (MHA→MQA→GQA)**: prefill의 score FLOPs는 **거의 그대로**, decode의 KV read만
+  g=H/H_kv배 줄어든다. bf16 decode AI가 정확히 g로 떨어지는 것이 교과서적 결과이고
+  (MHA 1.0, GQA×4 4.0, MQA×71 70.8) 테스트로 고정해 뒀다. 즉 이 축은 **decode 전용 효과**다.
+- **4 (SWA)**: local 층의 비용이 window에서 멈춘다. FLOPs와 bytes가 같은 비율로 줄어
+  **AI는 그대로**이고 총량만 준다 — capacity/throughput 이득이지 intensity 이득이 아니다.
+  c\*가 150K로 6배 밀린다(Gemma-3는 global 5층만 계속 자람).
+- **5 (MoE)**: active params가 줄어 GEMM FLOPs가 준다. 다만 expert weight는 token이 하나라도
+  가면 전부 읽히므로 **Σn과 무관한 floor**가 생긴다(Qwen1.5-MoE ≈ 25 GB, DeepSeek-V2-Lite
+  ≈ 29 GB per iteration → A100에서 12–15 ms). decode에서 B가 커지면 touch되는 expert가 늘어
+  FFN 시간이 FLOPs보다 **weight traffic**에 좌우된다 — exp5의 B축이 이걸 본다.
+- **6 (MLA)**: 유일하게 **prefill과 decode의 커널 종류가 다르다**. prefill은 prefix-hit된
+  latent를 64K chunk 단위로 gather → `kv_b_proj`로 head별 K/V 복원 → FA2 → `merge_attn_states`
+  이고, 이 복원 비용은 `2·r·H·(d_nope+d_v)·c`로 **n과 무관하게 c에 비례**한다. decode는
+  weight absorption으로 576-wide latent에 직접 score를 내므로 복원이 아예 없고, KV는 1 head로
+  줄지만 head당 score FLOPs가 2.8배 커진다 → **메모리 병목에서 연산 병목으로 이동**
+  (decode AI 30.2). 그래서 c\*를 하나의 수로 말할 수 없다(decode 4.8K vs prefill 9.8K).
+- **7 (DSA)**: indexer가 전 위치를 훑고(O(N), 저강도) 상위 top-k=2048만 sparse MLA로 간다.
+  분석 모델 기준 **indexer 비중이 c=4K에서 10.5%, 64K에서 65%, 1M에서 97%**로 커진다 —
+  "문맥이 길어지면 indexer가 몫을 가져가는가"가 이 계열의 측정 핵심이고, 그래서 attention
+  시간을 indexer / top-k 선택 / sparse attention 셋으로 쪼개야 한다. indexer의 KV는 MQA 1 head
+  FP8이라 바이트는 싸고 FLOPs만 자란다.
+- **8 (linear hybrid)**: 48층 중 12층만 softmax이므로 **문맥에 비례하는 attention이 1/4만
+  남는다**. 나머지 36층은 문맥과 무관한 recurrent state(요청당 약 38 MB, c와 무관)를 갖는다.
+  hidden 2048로 작아 GEMM이 얇으니 GPU 활용률이 낮을 수 있고, 비중 해석 시 이를 같이 봐야 한다.
+- **9 (CSA/HCA)**: V4-Flash는 arXiv 2606.19348 기준 최신 구조로, 제 지식 시점 이후라
+  **사양을 확인하지 못했다**. 분석 모델에 넣지 않았고 preset도 만들지 않았다. 넣으려면
+  CSA의 압축률과 HCA의 dense 범위를 원문에서 확정해야 한다.
+
+### 통제된 비교 쌍
+
+실제 모델끼리 비교하면 여러 변수가 동시에 바뀐다(Llama-2→Llama-3은 vocab 32K→128K, FFN
+11008→14336까지 같이 바뀌므로 **LM head GEMM을 분리 집계**한다 — `est_flops_lm_head`).
+그래서 **한 변수만 바꾼 synthetic config**를 `--load-format dummy`로 함께 돌린다
+(timing은 weight 값과 무관; `bench/synthetic_configs/`).
+
+| 쌍 | 바뀌는 것 | KV/token | decode AI@32K |
+|---|---|---|---|
+| `kv-mha-1.8b` → `kv-gqa4-1.8b` | `num_key_value_heads` 16→4 **만** | 192K → 48K | 1.0 → 4.0 |
+| `kv-gqa4-1.8b` → `kv-mqa-1.8b` | `num_key_value_heads` 4→1 **만** | 48K → 12K | 4.0 → 16.0 |
+| `kv-mha-1.8b` → `mla-dense-1.8b` | full KV → 576-wide latent | 192K → 27K | 1.0 → 30.2 |
+| `kv-mha-1.8b` → `swa-1.8b` | 5:1 local/global window **만** | 192K → 32K | 1.0 → 1.0 |
+| `qwen1.5-1.8b` → `qwen1.5-moe-a2.7b` | FFN dense→MoE **만** (attention 동일) | 192K → 192K | 1.0 → 1.0 |
+| `mistral-7b` → `mixtral-8x7b` | FFN dense→MoE **만** (tp≥2) | 128K → 128K | 4.0 → 4.0 |
+| `deepseek-v3` → `deepseek-v3.2` | DSA indexer 유무 **만** (분석) | 69K → 69K | 241 → 4.1 |
 
 ## 2. Attention AI 식 (검증됨)
 
@@ -140,6 +184,7 @@ MoE는 `fused_moe_kernel` + `moe_align_block_size_*` + `topk_softmax`/`moe_sum_*
 | Exp2 n-heterogeneity | Σn=8192, B=8, c ∈ {0, base_c, 2·base_c, 4·base_c} | CV(n) ∈ {0, .18, .38, 1.03, 1.87, 2.60} | Σn_i² 효과 (c=0) / kernel 효과 (c≫n) |
 | Exp3 c-heterogeneity | n=1024, B=8, mean(c)=base_c | CV(c) ∈ {0, .29, .61, 1.27, 1.94} | AI-neutral control |
 | Exp4 n-c correlation | 동일 {n},{c} multiset, mean(c)=base_c, B=8 | ρ ∈ 도달 가능 범위 7점 (≈ −0.6 … +0.98) | Σn_i·c_i 효과 (multi-turn의 핵심 항) |
+| **Exp5 decode** | **n_i = 1** | B ∈ {1,8,32,128,512} × c ∈ {0,1K,4K,16K,64K,256K} | **attention 계열 비교의 본무대**: KV read가 유일한 scaling 항. c축=attention, B축=MoE/FFN |
 
 `base_c`는 기본 `auto`(분석적 c\*(n=1024) 이상의 2의 거듭제곱)이며, Exp0 실측 c\*를
 보고 `--base-c`로 override한다. 동일 shape는 한 번만 측정하고 alias별로 기록한다.
@@ -155,9 +200,9 @@ pip install "vllm==0.28.*" pynvml pandas matplotlib     # kernel 이름/API는 0
 cd AgentSched
 
 # 0. GPU 없이: 테스트 + 측정 검증 + 아키텍처 비교 + feasibility
-python -m unittest discover -s tests -t .                           # 99 tests, ~2s
+python -m unittest discover -s tests -t .                           # 131 tests, ~2s
 python -m bench.selftest                                            # §7, 항상 먼저
-python -m bench.arch_compare --gpu-mem-gib 80
+python -m bench.arch_compare --pairs --gpu-mem-gib 80                # 계열표 + 통제 쌍
 python -m bench.configs --model qwen1.5-1.8b --gpu-mem-gib 80        # base_c auto, gate 0.95
 
 # 1. c* 찾기 (모델별)
@@ -169,12 +214,22 @@ python -m bench.runner --model Qwen/Qwen1.5-1.8B --exp exp1 exp2 exp3 exp4 \
     --base-c 16384 --kernel-profile
 python -m bench.analyze
 
-# 아키텍처 비교: 같은 명령을 아래 모델로 반복 (동일 raw.jsonl에 append; analyze가 모델별 분리)
-#   --model Qwen/Qwen3-1.7B                     # GQA ×2
-#   --model Qwen/Qwen2.5-3B                     # GQA ×8
-#   --model Qwen/Qwen1.5-MoE-A2.7B              # MHA+MoE (max_pos 8192 → hf_overrides 자동)
-#   --model deepseek-ai/DeepSeek-V2-Lite        # MLA+MoE (backend auto → TRITON_MLA + FA2 prefill)
-#   --model bench/synthetic_configs/mla-dense-1.8b --load-format dummy   # MLA dense (synthetic)
+# 3. decode (계열 비교의 본무대 — prefill과 따로 집계됨)
+python -m bench.runner --model Qwen/Qwen1.5-1.8B --exp exp5 --kernel-profile
+
+# 아키텍처 계열: 같은 명령을 아래 모델로 반복 (동일 raw.jsonl에 append; analyze가 모델·phase별 분리)
+#   1 MHA       --model NousResearch/Llama-2-7b-hf
+#   2 MQA       --model tiiuae/falcon-7b            # KV 8KB/token → c를 아주 크게 잡을 수 있음
+#   3 GQA       --model NousResearch/Meta-Llama-3-8B
+#   4 SWA       --model unsloth/gemma-3-4b-it       # local 29 / global 5, window 1024
+#   5 MoE       --model Qwen/Qwen1.5-MoE-A2.7B      # Mixtral은 93GB → tp≥2
+#   6 MLA       --model deepseek-ai/DeepSeek-V2-Lite
+# 통제 쌍 (한 변수만 다른 synthetic config, 가중치 불필요):
+#   --model bench/synthetic_configs/kv-mha-1.8b  --load-format dummy
+#   --model bench/synthetic_configs/kv-gqa4-1.8b --load-format dummy
+#   --model bench/synthetic_configs/kv-mqa-1.8b  --load-format dummy
+#   --model bench/synthetic_configs/swa-1.8b     --load-format dummy
+#   --model bench/synthetic_configs/mla-dense-1.8b --load-format dummy
 # 옵션: --load-format dummy (random weight, 다운로드 없음), --kv-cache-dtype fp8
 ```
 
@@ -195,6 +250,7 @@ per-iteration busy time은 kernel profile을 쓸 것). `--trust-remote-code`는 
 - `summary.csv` — 위 + 효과 분해 열
 - `exp0_dominance.png` — latency, latency/latency(c=0), attention 시간 비중 vs c (모델×B)
 - `exp1_fragmentation.png`, `exp2_n_hetero.png`, `exp3_c_hetero.png`, `exp4_pairing.png`
+- `exp5_decode.png` — decode latency/throughput vs c 와 vs B (계열 비교용)
 - `arch_compare.png/.txt` — 분석 모델의 아키텍처 비교
 - `report.txt` — c\*, 고정 budget에서의 latency 산포, cost-model R² 비교, 효과 분해 표
 
@@ -260,6 +316,7 @@ GPU 없이 2초 안에 도는 99개 테스트. `bench/selftest.py`(§7)가 "측�
 | `test_metrics.py` | ModelSpec 파싱·유도량 | **preset 하드코딩 값 == config.json 파싱 결과** (손입력 오류 차단), MoE 키 변형(`num_experts`/`n_routed_experts`/`num_local_experts`), MLA c\*의 n 의존성, fp8 KV가 읽기 바이트를 반으로, expert weight가 Σn floor인지, attention 항의 request 가산성 |
 | `test_analyze.py` | 분석 파이프라인 | 효과 분해 항등식, 모델·그룹 간 기준행이 섞이지 않는지, c\* 탐지(측정 share / latency 2배 fallback / c=0 행 없음), 전부 skip된 입력, `fit_r2` 성질, synth→analyze end-to-end |
 | `test_runner.py` | GPU 비의존 부분 | 분류기 순서 의존성(어떤 것이 실제로 load-bearing인지), 키가 전부 소문자인지, NVML/capacity 조회, plan CLI와 runner의 base_c·capacity gate 일치 |
+| `test_families.py` | 아키텍처 계열 | layer stack 분해(SWA 5:1, linear 3:1), decode AI == group size, SWA가 AI를 안 바꾸고 총량만 줄인다는 것, DSA indexer 비중 증가, 통제 쌍이 실제로 한 변수만 다른지, synthetic config가 preset과 일치하는지, tier가 단일 GPU 적재 가능성과 맞는지 |
 | `test_selftest.py` | §7 검증을 테스트로 | selftest의 3개 검사를 CI에서도 실패하게 |
 
 ## 9. 해석 가이드

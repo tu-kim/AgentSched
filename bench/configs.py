@@ -202,6 +202,24 @@ def exp3_c_heterogeneity(base_c):
             for k, cs in C_TEMPLATES.items()]
 
 
+# ---------------------------------------------------------------- Exp 5
+def exp5_decode(base_c=None):
+    """Pure decode: n_i = 1, so the only work that scales is the KV read.
+
+    This is where the attention families actually differ — GQA/MQA/MLA barely
+    change prefill score FLOPs but divide the decode KV traffic by the group
+    size (or collapse it to one latent head). Sweeping B and c separately is
+    required because the attention share moves with c while the MoE/FFN share
+    moves with B (more tokens ⇒ more distinct experts touched).
+    """
+    cfgs = []
+    for c in [0, K, 4 * K, 16 * K, 64 * K, 256 * K]:
+        for B in [1, 8, 32, 128, 512]:
+            cfgs.append(BatchConfig("exp5", f"decode_B{B}_c{align(c)}", [(1, align(c))] * B,
+                                    group=f"c={align(c)}"))
+    return cfgs
+
+
 # ---------------------------------------------------------------- Exp 4
 EXP4_NS = [32, 64, 128, 256, 512, 1024, 2048, 4128]           # Σ = 8192, 129× spread
 EXP4_C_TEMPLATE = [2, 4, 8, 16, 24, 40, 64, 98]               # × base_c/32, Σ = 256 → mean = base_c
@@ -233,7 +251,14 @@ GENERATORS = {
     "exp2": exp2_n_heterogeneity,
     "exp3": exp3_c_heterogeneity,
     "exp4": exp4_correlation,
+    "exp5": lambda base_c: exp5_decode(),
 }
+
+# exp0-4 are prefill (n_i ≥ 16); exp5 is decode (n_i = 1). They must be reported
+# separately: the attention families change decode KV traffic far more than they
+# change prefill score FLOPs, and mixing the two hides the effect.
+PREFILL_EXPS = ("exp0", "exp1", "exp2", "exp3", "exp4")
+DECODE_EXPS = ("exp5",)
 
 
 def all_configs(exps=None, base_c=32 * K):

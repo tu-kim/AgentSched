@@ -1,0 +1,29 @@
+{
+  "architectures": [
+    "Qwen2ForCausalLM"
+  ],
+  "model_type": "qwen2",
+  "hidden_size": 2048,
+  "num_hidden_layers": 24,
+  "num_attention_heads": 16,
+  "intermediate_size": 5504,
+  "hidden_act": "silu",
+  "vocab_size": 151936,
+  "max_position_embeddings": 32768,
+  "rope_theta": 1000000.0,
+  "rms_norm_eps": 1e-06,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "use_cache": true,
+  "attention_dropout": 0.0,
+  "initializer_range": 0.02,
+  "use_sliding_window": true,
+  "bos_token_id": 151643,
+  "eos_token_id": 151643,
+  "transformers_version": "4.44.0",
+  "num_key_value_heads": 16,
+  "sliding_window": 1024,
+  "sliding_window_pattern": 6,
+  "max_window_layers": 0,
+  "_comment": "Sliding window: ONLY the 5:1 local/global pattern differs from kv-mha-1.8b. Synthetic config for the controlled KV-sharing sweep; run with --load-format dummy (timing is weight-value independent)."
+}
