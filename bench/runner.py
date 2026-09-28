@@ -339,6 +339,9 @@ def main():
                          + ", ".join(DEVICES))
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--gpu-mem-util", type=float, default=0.90)
+    ap.add_argument("--gpu-mem-gib", type=float, default=None,
+                    help="override the detected GPU memory size used by the pre-build "
+                         "capacity gate (e.g. 40 on an A100-40GB)")
     ap.add_argument("--capacity-margin", type=float, default=0.95)
     ap.add_argument("--enforce-eager", action="store_true")
     ap.add_argument("--attention-backend", default="auto",
@@ -370,6 +373,25 @@ def main():
         print("[model] NOTE: MoE with TP>1; keep expert parallelism disabled (default) for this study")
 
     cfgs = all_configs(args.exp, base_c)
+    # Size the engine from the configs that can actually run. The capacity gate
+    # further down uses the engine's real block count, but max_model_len is fixed
+    # at build time: leaving an infeasible c=524288 config in the set makes vLLM
+    # reserve a KV cache and a RoPE table for a 512K-token sequence, and it OOMs
+    # during startup profiling -- before the gate ever runs. So gate analytically
+    # here, with the same arithmetic bench.configs' planner uses.
+    mem_gib = args.gpu_mem_gib or detect_device(args.gpu).mem_gib
+    analytic_cap = spec.kv_capacity_tokens(mem_gib, args.gpu_mem_util, tp=args.tp)
+    fits = lambda c: c.kv_tokens_needed() <= analytic_cap * args.capacity_margin
+    infeasible = [c for c in cfgs if not fits(c)]
+    cfgs = [c for c in cfgs if fits(c)]
+    if infeasible:
+        print(f"[plan] {len(infeasible)} configs need more KV than {mem_gib:.0f}GiB holds "
+              f"({analytic_cap:,} tokens at util={args.gpu_mem_util}, "
+              f"margin={args.capacity_margin}); dropped before the engine is built")
+    if not cfgs:
+        raise SystemExit(f"no config fits {mem_gib:.0f}GiB: every one needs more than "
+                         f"{analytic_cap:,} KV tokens. Lower --base-c, or use a smaller "
+                         f"model / --kv-cache-dtype fp8.")
     shapes = group_by_shape(cfgs)
     max_ctx = max(max(n + c for n, c in c.pairs) for c in cfgs) + MAX_MODEL_LEN_PAD
     max_seqs = max(c.batch_size for c in cfgs)
@@ -425,6 +447,12 @@ def main():
     consecutive_errors = []
     warn_state = set()                          # each profiling warning printed once per run
     with outp.open("a") as f:
+        for c in infeasible:                    # accounted for, not silently gone
+            rec = dict(skipped=True,
+                       reason=f"needs {c.kv_tokens_needed():,} KV tokens > "
+                              f"analytic capacity {analytic_cap:,} on {mem_gib:.0f}GiB",
+                       exp=c.exp, name=c.name, group=c.group, **c.stats(), **model_meta)
+            f.write(json.dumps(rec) + "\n")
         for key, aliases in shapes.items():
             cfg = aliases[0]
             t = time.time()
