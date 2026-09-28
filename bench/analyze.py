@@ -29,8 +29,17 @@ KERNEL_CLASSES = ["attention", "gemm", "moe", "activation", "kvcache", "other"]
 
 def load(paths):
     rows = []
+    missing = [p for p in paths if not Path(p).exists()]
+    if missing:
+        raise SystemExit(
+            "no results to analyse: " + ", ".join(str(p) for p in missing)
+            + "\nbench.runner writes this file (append + flush per shape), so an empty"
+            "\ndirectory means the run never reached the measurement loop — or it ran"
+            "\nsomewhere else. Check the runner's [engine]/[plan] output on the GPU host.")
     for p in paths:
         rows += [json.loads(l) for l in Path(p).read_text().splitlines() if l.strip()]
+    if not rows:
+        raise SystemExit(f"{paths} contains no records; the run produced nothing.")
     ok = [r for r in rows if not r.get("skipped")]
     skipped = [(r.get("model"), r.get("exp"), r.get("name"), r.get("reason")) for r in rows if r.get("skipped")]
     df = pd.DataFrame(ok)
