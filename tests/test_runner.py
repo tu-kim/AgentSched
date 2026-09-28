@@ -79,6 +79,71 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(classify("void flash::flash_fwd_splitkv_kernel<...>(...)"), "attention")
 
 
+class TestAttentionGemmBoundary(unittest.TestCase):
+    """Where the line between the attention and GEMM buckets falls.
+
+    The whole study rests on this split, so it is pinned rather than trusted:
+    attention = the fused score kernel (QK^T, softmax, P·V); gemm = the four
+    linear projections. The analytic model must draw the same line.
+    """
+
+    FUSED_ATTN = [
+        # FA2 on a paged KV cache — vLLM always passes a block_table
+        "void flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<128, 128, 64, 4, "
+        "false, false, cutlass::bfloat16_t>, false, true, false, false, true, false>"
+        "(flash::Flash_fwd_params)",
+        # the cross-split LSE rescaling — softmax time lives here too
+        "void flash::flash_fwd_splitkv_combine_kernel<Flash_fwd_kernel_traits<128, 64, 128, 8>, "
+        "4, false>(flash::Flash_fwd_params)",
+        # FA3
+        "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<...>>>(...)",
+        "void cutlass::device_kernel<flash::FlashAttnFwdCombine<...>>(...)",
+    ]
+    PROJECTIONS = [
+        "nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN",
+        "sm80_xmma_gemm_bf16bf16_bf16f32_f32_tn_n_tilesize128x128x32_stage3_warpsize2x2x1",
+        "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_32x5_tn",
+        "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_bf16_128x128_32x5_tn_align8>(...)",
+    ]
+
+    def test_qk_softmax_and_pv_are_one_attention_kernel(self):
+        """QK^T, softmax and P·V are never separate kernels: FlashAttention keeps S
+        in registers and fuses all three. So there is no standalone softmax kernel
+        whose time could be misfiled -- the fused kernel covers all of it."""
+        for name in self.FUSED_ATTN:
+            self.assertEqual(classify(name), "attention", name[:80])
+
+    def test_no_key_list_claims_softmax(self):
+        """Corollary: 'softmax' appears only in the MoE router keys. If an attention
+        backend ever emitted a separate softmax kernel it would land in 'other', and
+        validate_buckets' >25% 'other' warning is what would catch it."""
+        for keys, bucket in ((ATTN_KEYS, "attention"), (GEMM_KEYS, "gemm")):
+            self.assertFalse([k for k in keys if "softmax" in k], bucket)
+        self.assertTrue([k for k in MOE_KEYS if "softmax" in k])
+
+    def test_qkv_and_o_projections_are_gemm(self):
+        for name in self.PROJECTIONS:
+            self.assertEqual(classify(name), "gemm", name[:80])
+            self.assertFalse(any(k in name.lower() for k in ATTN_KEYS),
+                             "a projection must not match an attention key")
+
+    def test_analytic_model_draws_the_same_line(self):
+        """est_flops_attn is score FLOPs only; the qkv/o projections sit in
+        est_flops_body via attn_proj_params. Mixing them would make the measured
+        attention share and the predicted one incomparable."""
+        from bench.metrics import MODEL_PRESETS, estimate_flops_bytes
+        spec = MODEL_PRESETS["qwen1.5-1.8b"]
+        n, c = 1024, 0
+        est = estimate_flops_bytes(spec, [(n, c)])
+        # score FLOPs at c=0 are the causal triangle: per_pair * n(n+1)/2 per layer
+        expect = spec.attn_flops_per_pair(n) * spec.n_layers * n * (n + 1) / 2
+        self.assertAlmostEqual(est["est_flops_attn"], expect, delta=expect * 1e-9)
+        # the projections are in the body term, and they are not negligible
+        proj = 2.0 * spec.attn_proj_params * spec.n_layers * n   # per-layer × stack
+        self.assertLessEqual(proj, est["est_flops_body"])
+        self.assertGreater(proj / est["est_flops_body"], 0.1)
+
+
 class TestValidateBuckets(unittest.TestCase):
     def full(self, **kw):
         b = dict(attention=1.0, gemm=1.0, moe=0.0, activation=0.1, kvcache=0.1, other=0.1)
